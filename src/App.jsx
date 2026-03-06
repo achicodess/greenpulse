@@ -1063,7 +1063,8 @@ export default function App() {
           <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
             {renderSection()}
           </div>
-        </main>
+        <DiligenceFooter />
+</main>
       </div>
     </>
   );
