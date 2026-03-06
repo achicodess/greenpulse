@@ -1063,9 +1063,43 @@ export default function App() {
           <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
             {renderSection()}
           </div>
-        <DiligenceFooter />
-</main>
+          <DiligenceFooter />
+        </main>
       </div>
     </>
   );
 }
+
+// ─── DILIGENCE FOOTER ─────────────────────────────────────────────
+const DiligenceFooter = () => (
+  <div style={{
+    flexShrink:0, borderTop:`1px solid #162236`,
+    background:"#08111e", padding:"12px 36px",
+    display:"flex", justifyContent:"space-between",
+    alignItems:"center", gap:16,
+  }}>
+    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+      <div style={{ width:6, height:6, borderRadius:"50%",
+        background:"#00ff9d", boxShadow:"0 0 8px #00ff9d" }} />
+      <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
+        color:"#4a6080", letterSpacing:"0.08em" }}>
+        Built with Claude Sonnet 4.6 · Anthropic
+      </span>
+    </div>
+    <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
+      color:"#4a6080", letterSpacing:"0.06em", textAlign:"center" }}>
+      AI was used to build this dashboard. All outputs reviewed &amp; approved by the author.
+    </span>
+    <a href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"
+      target="_blank" rel="noopener noreferrer"
+      style={{ display:"flex", alignItems:"center", gap:6, flexShrink:0,
+        background:"#00ff9d18", border:"1px solid #00ff9d44",
+        borderRadius:6, padding:"5px 14px", textDecoration:"none" }}>
+      <span style={{ fontSize:12 }}>📄</span>
+      <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
+        color:"#00ff9d", letterSpacing:"0.08em" }}>
+        AI Diligence Statement ↗
+      </span>
+    </a>
+  </div>
+);
