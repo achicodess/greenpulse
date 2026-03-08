@@ -156,23 +156,23 @@ async function fetchEIA(apiKey) {
 }
 
 // ─── ALPHA VANTAGE FETCH ──────────────────────────────────────────
-async function fetchAV(ticker, apiKey) {
-  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${apiKey}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!res.ok) throw new Error(`AV HTTP ${res.status}`);
-  const json = await res.json();
-  if (json["Note"]) throw new Error("Alpha Vantage rate limit hit. Try again in a minute.");
-  if (json["Information"]) throw new Error("Alpha Vantage API limit reached for today.");
-  const q = json["Global Quote"];
-  if (!q || !q["05. price"]) throw new Error(`No data for ${ticker}`);
-  const change = parseFloat(q["09. change"]);
-  const pct = parseFloat(q["10. change percent"]);
+async function fetchFinnhub(ticker, apiKey) {
+  const [quoteRes, profileRes] = await Promise.all([
+    fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${apiKey}`, { signal: AbortSignal.timeout(8000) }),
+    fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${apiKey}`, { signal: AbortSignal.timeout(8000) }),
+  ]);
+  if (!quoteRes.ok) throw new Error(`Finnhub HTTP ${quoteRes.status}`);
+  const q = await quoteRes.json();
+  if (q.error) throw new Error(`Finnhub: ${q.error}`);
+  if (!q.c) throw new Error(`No data for ${ticker}`);
+  const change = q.c - q.pc;
+  const pct = q.pc ? ((change / q.pc) * 100) : 0;
   return {
-    price: parseFloat(q["05. price"]).toFixed(2),
+    price: q.c.toFixed(2),
     change: (change >= 0 ? "+" : "") + change.toFixed(2),
     pct: (pct >= 0 ? "+" : "") + pct.toFixed(2),
-    vol: parseInt(q["06. volume"]).toLocaleString(),
-    high: parseFloat(q["03. high"]).toFixed(2),
+    vol: "—",
+    high: q.h.toFixed(2),
     low: parseFloat(q["04. low"]).toFixed(2),
   };
 }
@@ -490,17 +490,17 @@ const Markets = ({ apiKeys }) => {
   const [live, setLive] = useState(false);
   const [selected, setSelected] = useState("FSLR");
   const [lastUpdated, setLastUpdated] = useState(null);
-  const noKey = !apiKeys.alphaVantage;
+  const noKey = !apiKeys.finnhub;
 
   const refresh = useCallback(async () => {
-    if (!apiKeys.alphaVantage) return;
+    if (!apiKeys.finnhub) return;
     setLoading(true); setErrors([]);
     const results = { ...MOCK_QUOTES };
     const errs = [];
     // AV free tier: 25 req/day, ~5/min. Fetch first 6 with spacing.
     for (const ticker of TICKERS.slice(0, 6)) {
       try {
-        results[ticker] = await fetchAV(ticker, apiKeys.alphaVantage);
+        results[ticker] = await fetchFinnhub(ticker, apiKeys.finnhub);
       } catch (e) {
         errs.push(`${ticker}: ${e.message}`);
       }
@@ -512,9 +512,9 @@ const Markets = ({ apiKeys }) => {
     setLive(true);
     setLastUpdated(new Date());
     setLoading(false);
-  }, [apiKeys.alphaVantage]);
+  }, [apiKeys.finnhub]);
 
-  useEffect(() => { if (apiKeys.alphaVantage) refresh(); }, [apiKeys.alphaVantage]);
+  useEffect(() => { if (apiKeys.finnhub) refresh(); }, [apiKeys.finnhub]);
 
   const sel = quotes[selected] || MOCK_QUOTES[selected];
   const selUp = sel && parseFloat(sel.change) >= 0;
@@ -535,7 +535,7 @@ const Markets = ({ apiKeys }) => {
           </div>
         }
       />
-      {noKey && <ErrorBanner msg="Enter your Alpha Vantage API key in Settings to enable live quotes. Showing demo data." color={T.yellow} />}
+      {noKey && <ErrorBanner msg="Enter your Finnhub API key in Settings to enable live quotes. Showing demo data." color={T.yellow} />}
       {errors.map((e,i) => <ErrorBanner key={i} msg={e} color={T.red} />)}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:16 }}>
         {TICKERS.map(t => {
@@ -816,9 +816,9 @@ const Settings = ({ apiKeys, setApiKeys }) => {
       if (key === "eia") {
         await fetchEIA(local.eia);
         setTestResults(r => ({ ...r, eia:{ ok:true, msg:"✓ EIA connection successful!" } }));
-      } else if (key === "alphaVantage") {
-        await fetchAV("FSLR", local.alphaVantage);
-        setTestResults(r => ({ ...r, alphaVantage:{ ok:true, msg:"✓ Alpha Vantage connection successful!" } }));
+      } else if (key === "finnhub") {
+        await fetchFinnhub("FSLR", local.finnhub);
+        setTestResults(r => ({ ...r, finnhub:{ ok:true, msg:"✓ Finnhub connection successful!" } }));
       } else if (key === "gnews") {
         await fetchGNews("solar", local.gnews);
         setTestResults(r => ({ ...r, gnews:{ ok:true, msg:"✓ GNews connection successful!" } }));
@@ -833,9 +833,9 @@ const Settings = ({ apiKeys, setApiKeys }) => {
     { key:"eia", label:"EIA API Key", color:T.green,
       hint:"Free — register at eia.gov/opendata", link:"https://www.eia.gov/opendata/register.php",
       desc:"Powers real-time US solar generation charts in Solar and Overview." },
-    { key:"alphaVantage", label:"Alpha Vantage API Key", color:T.cyan,
-      hint:"Free tier: 25 req/day — alphavantage.co", link:"https://www.alphavantage.co/support/#api-key",
-      desc:"Powers live stock quotes in the Markets section." },
+    { key:"finnhub", label:"Finnhub API Key", color:T.cyan,
+      hint:"Free tier: 60 req/min — finnhub.io", link:"https://finnhub.io/register",
+      desc:"Powers real-time stock quotes in the Markets section. 60 req/min on free tier." },
     { key:"gnews", label:"GNews API Key", color:T.purple,
       hint:"Free tier: 100 req/day — gnews.io", link:"https://gnews.io",
       desc:"Powers live green energy headlines in the News section." },
@@ -909,7 +909,7 @@ const Settings = ({ apiKeys, setApiKeys }) => {
           display:"block", marginBottom:14 }}>Data Source Status</Mono>
         {[
           { label:"EIA API", desc:"US solar generation (monthly)", key:"eia", color:T.green },
-          { label:"Alpha Vantage", desc:"Live equity quotes", key:"alphaVantage", color:T.cyan },
+          { label:"Finnhub", desc:"Real-time equity quotes", key:"finnhub", color:T.cyan },
           { label:"GNews API", desc:"Live green energy headlines", key:"gnews", color:T.purple },
         ].map((s,i) => {
           const active = !!local[s.key];
@@ -949,7 +949,7 @@ const NAV = [
 // ─── APP ROOT ────────────────────────────────────────────────────
 export default function App() {
   const [active, setActive] = useState("overview");
-  const [apiKeys, setApiKeys] = useState({ eia:"", alphaVantage:"", gnews:"" });
+  const [apiKeys, setApiKeys] = useState({ eia:"", finnhub:"", gnews:"" });
 
   // Persist keys to localStorage so they survive hot-reloads
   useEffect(() => {
@@ -1009,8 +1009,8 @@ export default function App() {
             ))}
           </nav>
           <div style={{ padding:"14px 18px", borderTop:`1px solid ${T.border}` }}>
-            {["EIA","Alpha Vantage","GNews"].map((s,i) => {
-              const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Alpha Vantage"&&apiKeys.alphaVantage)||(s==="GNews"&&apiKeys.gnews);
+            {["EIA","Finnhub","GNews"].map((s,i) => {
+              const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Finnhub"&&apiKeys.finnhub)||(s==="GNews"&&apiKeys.gnews);
               return (
                 <div key={i} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
                   <div style={{ width:5, height:5, borderRadius:"50%",
