@@ -26,7 +26,7 @@
 
 ## What Is This
 
-GreenPulse is a dark-mode intelligence dashboard for the global green energy sector. It aggregates live data across three independent APIs — US solar generation from the EIA, real-time equity quotes from Finnhub, and green energy headlines from GNews — and renders them as interactive charts, maps, scorecards, and news feeds inside a fully client-side React application.
+GreenPulse is a dark-mode intelligence dashboard for the global green energy sector. It aggregates live data across three independent APIs: US solar generation from the EIA, real-time equity quotes from Finnhub, and green energy headlines from GNews — and renders them as interactive charts, maps, scorecards, and news feeds inside a fully client-side React application.
 
 No backend. No database. No server. Just a single `App.jsx` pulling live data directly from public APIs, built and deployed entirely on free-tier infrastructure.
 
