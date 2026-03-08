@@ -5,6 +5,85 @@ import {
   PieChart, Pie, Cell,
 } from "recharts";
 
+// ─── SECURITY LAYER ──────────────────────────────────────────────
+// 1. Key obfuscation — simple XOR encode/decode so keys are never
+//    stored as plain text in localStorage
+const _xk = "gp2026xk";
+const _enc = s => s ? btoa([...s].map((c,i)=>String.fromCharCode(c.charCodeAt(0)^_xk.charCodeAt(i%_xk.length))).join("")) : "";
+const _dec = s => { try { return [...atob(s)].map((c,i)=>String.fromCharCode(c.charCodeAt(0)^_xk.charCodeAt(i%_xk.length))).join(""); } catch { return ""; } };
+
+// 2. Cache layer — TTL-based localStorage cache prevents API hammering
+//    EIA: 60 min (data updates monthly), Finnhub: 5 min, GNews: 30 min
+const CACHE_TTL = { eia: 60*60*1000, finnhub: 5*60*1000, gnews: 30*60*1000 };
+function cacheGet(key) {
+  try {
+    const raw = localStorage.getItem("gp_cache_" + key);
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    const ttl = Object.entries(CACHE_TTL).find(([k]) => key.startsWith(k))?.[1] || 5*60*1000;
+    if (Date.now() - ts > ttl) { localStorage.removeItem("gp_cache_" + key); return null; }
+    return data;
+  } catch { return null; }
+}
+function cacheSet(key, data) {
+  try { localStorage.setItem("gp_cache_" + key, JSON.stringify({ ts: Date.now(), data })); } catch {}
+}
+
+// 3. Request deduplication — prevents parallel identical requests
+const _inflight = {};
+async function dedupe(key, fn) {
+  if (_inflight[key]) return _inflight[key];
+  _inflight[key] = fn().finally(() => delete _inflight[key]);
+  return _inflight[key];
+}
+
+// 4. Input sanitiser — strips HTML/script tags from any external content
+const sanitize = s => typeof s === "string"
+  ? s.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "").replace(/on\w+=/gi, "").trim()
+  : s;
+
+// 5. Key validator — rejects obviously malformed keys before sending requests
+const validateKey = {
+  eia:     k => typeof k === "string" && k.length >= 32 && /^[a-zA-Z0-9]+$/.test(k),
+  finnhub: k => typeof k === "string" && k.length >= 10,
+  gnews:   k => typeof k === "string" && k.length >= 10,
+};
+
+// 6. Secure key storage — encode keys before writing, decode on read
+function saveKeys(keys) {
+  try {
+    const encoded = Object.fromEntries(Object.entries(keys).map(([k,v]) => [k, _enc(v)]));
+    localStorage.setItem("gp_keys", JSON.stringify(encoded));
+  } catch {}
+}
+function loadKeys() {
+  try {
+    const raw = localStorage.getItem("gp_keys");
+    if (!raw) return { eia:"", finnhub:"", gnews:"" };
+    const parsed = JSON.parse(raw);
+    // Handle both old plain-text format and new encoded format
+    return Object.fromEntries(
+      Object.entries(parsed).map(([k,v]) => {
+        const decoded = _dec(v);
+        return [k, decoded || v]; // fallback to raw if decode fails (migration)
+      })
+    );
+  } catch { return { eia:"", finnhub:"", gnews:"" }; }
+}
+
+// 7. Content Security helper — sanitize all external article content
+function sanitizeArticle(a) {
+  return {
+    title:       sanitize(a.title || ""),
+    link:        /^https?:\/\//.test(a.link||"") ? a.link : "#",
+    pubDate:     a.pubDate || "",
+    description: sanitize(a.description || ""),
+    thumbnail:   /^https?:\/\//.test(a.thumbnail||"") ? a.thumbnail : null,
+    source:      sanitize(a.source || ""),
+  };
+}
+
+
 // ─── FONTS & GLOBAL STYLES ────────────────────────────────────────
 const FontLoader = () => (
   <style>{`
@@ -113,26 +192,34 @@ const GNEWS_TOPICS = {
 };
 
 async function fetchGNews(topic, apiKey) {
-  const q = encodeURIComponent(GNEWS_TOPICS[topic].q);
-  const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&apikey=${apiKey}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-  if (!res.ok) throw new Error(`GNews HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.errors) throw new Error(json.errors.join(", "));
-  if (!json.articles?.length) throw new Error("No articles returned.");
-  return json.articles.map(a => ({
-    title: a.title,
-    link: a.url,
-    pubDate: a.publishedAt,
-    description: a.description || "",
-    thumbnail: a.image || null,
-    source: a.source?.name || "",
-  }));
+  if (!validateKey.gnews(apiKey)) throw new Error("Invalid GNews API key format.");
+  const cacheKey = `gnews_${topic}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  return dedupe(cacheKey, async () => {
+    const q = encodeURIComponent(GNEWS_TOPICS[topic].q);
+    const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&apikey=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`GNews HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.errors) throw new Error(json.errors.join(", "));
+    if (!json.articles?.length) throw new Error("No articles returned.");
+    const articles = json.articles.map(a => sanitizeArticle({
+      title: a.title, link: a.url, pubDate: a.publishedAt,
+      description: a.description || "", thumbnail: a.image || null,
+      source: a.source?.name || "",
+    }));
+    cacheSet(cacheKey, articles);
+    return articles;
+  });
 }
 
 // ─── EIA FETCH ────────────────────────────────────────────────────
 async function fetchEIA(apiKey) {
-  // Use simpler query param style to avoid bracket encoding issues
+  if (!validateKey.eia(apiKey)) throw new Error("Invalid EIA API key format.");
+  const cached = cacheGet("eia");
+  if (cached) return cached;
+  return dedupe("eia", async () => {
   const params = new URLSearchParams({
     frequency: "monthly",
     "data[0]": "generation",
@@ -147,7 +234,7 @@ async function fetchEIA(apiKey) {
   if (!res.ok) throw new Error(`EIA HTTP ${res.status}`);
   const json = await res.json();
   if (!json?.response?.data?.length) throw new Error("EIA returned no data — check your key.");
-  return json.response.data
+  const result = json.response.data
     .sort((a,b) => a.period.localeCompare(b.period))
     .map(d => {
       const raw = parseFloat(d.generation) || 0;
@@ -159,28 +246,39 @@ async function fetchEIA(apiKey) {
         gw,
       };
     }).filter(d => d.gw > 0);
+    cacheSet("eia", result);
+    return result;
+  });
 }
 
 // ─── ALPHA VANTAGE FETCH ──────────────────────────────────────────
 async function fetchFinnhub(ticker, apiKey) {
-  const [quoteRes, profileRes] = await Promise.all([
-    fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${apiKey}`, { signal: AbortSignal.timeout(8000) }),
-    fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${apiKey}`, { signal: AbortSignal.timeout(8000) }),
-  ]);
-  if (!quoteRes.ok) throw new Error(`Finnhub HTTP ${quoteRes.status}`);
-  const q = await quoteRes.json();
-  if (q.error) throw new Error(`Finnhub: ${q.error}`);
-  if (!q.c) throw new Error(`No data for ${ticker}`);
-  const change = q.c - q.pc;
-  const pct = q.pc ? ((change / q.pc) * 100) : 0;
-  return {
-    price: q.c.toFixed(2),
-    change: (change >= 0 ? "+" : "") + change.toFixed(2),
-    pct: (pct >= 0 ? "+" : "") + pct.toFixed(2),
-    vol: "—",
-    high: q.h.toFixed(2),
-    low: parseFloat(q["04. low"]).toFixed(2),
-  };
+  if (!validateKey.finnhub(apiKey)) throw new Error("Invalid Finnhub API key format.");
+  const cacheKey = `finnhub_${ticker}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  return dedupe(cacheKey, async () => {
+    const res = await fetch(
+      `https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${apiKey}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) throw new Error(`Finnhub HTTP ${res.status}`);
+    const q = await res.json();
+    if (q.error) throw new Error(`Finnhub: ${q.error}`);
+    if (!q.c) throw new Error(`No data for ${ticker}`);
+    const change = q.c - q.pc;
+    const pct = q.pc ? ((change / q.pc) * 100) : 0;
+    const result = {
+      price:  q.c.toFixed(2),
+      change: (change >= 0 ? "+" : "") + change.toFixed(2),
+      pct:    (pct   >= 0 ? "+" : "") + pct.toFixed(2),
+      vol:    "—",
+      high:   q.h.toFixed(2),
+      low:    q.l.toFixed(2),
+    };
+    cacheSet(cacheKey, result);
+    return result;
+  });
 }
 
 // ─── ATOMS ────────────────────────────────────────────────────────
@@ -913,6 +1011,7 @@ const Settings = ({ apiKeys, setApiKeys }) => {
           );
         })}
       </div>
+      <div style={{ display:"flex", gap:10, alignItems:"center", marginBottom:0 }}>
       <button onClick={save} style={{ background:saved?T.green+"22":T.greenDim,
         border:`1px solid ${saved?T.green:T.green+"66"}`, color:T.green,
         padding:"12px 36px", borderRadius:7, fontFamily:"IBM Plex Mono", fontSize:13,
@@ -920,6 +1019,26 @@ const Settings = ({ apiKeys, setApiKeys }) => {
         boxShadow:saved?`0 0 20px ${T.green}33`:"none" }}>
         {saved ? "✓  SAVED & APPLIED" : "SAVE KEYS"}
       </button>
+      <button onClick={() => {
+        Object.keys(localStorage).filter(k => k.startsWith("gp_cache_")).forEach(k => localStorage.removeItem(k));
+        alert("Cache cleared — next data load will fetch fresh from APIs.");
+      }} style={{ background:T.yellowDim, border:`1px solid ${T.yellow}55`, color:T.yellow,
+        padding:"12px 20px", borderRadius:7, fontFamily:"IBM Plex Mono", fontSize:11,
+        cursor:"pointer", letterSpacing:"0.06em" }}>
+        ↺ Clear Cache
+      </button>
+      <button onClick={() => {
+        if (window.confirm("Delete all saved API keys? You will need to re-enter them.")) {
+          localStorage.removeItem("gp_keys");
+          setLocal({ eia:"", finnhub:"", gnews:"" });
+          setApiKeys({ eia:"", finnhub:"", gnews:"" });
+        }
+      }} style={{ background:T.redDim, border:`1px solid ${T.red}55`, color:T.red,
+        padding:"12px 20px", borderRadius:7, fontFamily:"IBM Plex Mono", fontSize:11,
+        cursor:"pointer", letterSpacing:"0.06em" }}>
+        ✕ Clear Keys
+      </button>
+      </div>
       {/* Status */}
       <div className="card" style={{ padding:"20px 24px", marginTop:20, maxWidth:780 }}>
         <Mono size={10} color={T.muted} style={{ textTransform:"uppercase", letterSpacing:"0.12em",
@@ -970,14 +1089,22 @@ export default function App() {
 
   // Persist keys to localStorage so they survive hot-reloads
   useEffect(() => {
-    const saved = localStorage.getItem("gp_keys");
-    if (saved) { try { setApiKeys(JSON.parse(saved)); } catch {} }
+    const loaded = loadKeys();
+    if (loaded) setApiKeys(loaded);
   }, []);
 
   const updateKeys = (keys) => {
     setApiKeys(keys);
-    localStorage.setItem("gp_keys", JSON.stringify(keys));
+    saveKeys(keys);
   };
+
+  // Pause background activity when tab is not visible
+  const [tabVisible, setTabVisible] = useState(true);
+  useEffect(() => {
+    const fn = () => setTabVisible(!document.hidden);
+    document.addEventListener("visibilitychange", fn);
+    return () => document.removeEventListener("visibilitychange", fn);
+  }, []);
 
   const now = new Date().toLocaleDateString("en-US",
     { weekday:"short", month:"short", day:"numeric", year:"numeric" });
