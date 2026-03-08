@@ -104,30 +104,70 @@ const MAP_REGIONS = [
   {id:"br",name:"Brazil",solar:32,h2:28,x:28,y:63},
 ];
 
-// ─── GNEWS FETCH ─────────────────────────────────────────────────
-const GNEWS_TOPICS = {
-  solar:     { label:"Solar",     q:"solar energy",         color:T.green  },
-  hydrogen:  { label:"Hydrogen",  q:"green hydrogen energy", color:T.cyan   },
-  markets:   { label:"Markets",   q:"clean energy stocks",   color:T.yellow },
-  policy:    { label:"Policy",    q:"renewable energy policy",color:T.purple },
-};
+// ─── RSS FETCH (multi-fallback) ───────────────────────────────────
+// Tries several CORS-friendly RSS→JSON services in sequence
+async function fetchRSSFeed(rssUrl) {
+  const encoded = encodeURIComponent(rssUrl);
 
-async function fetchGNews(topic, apiKey) {
-  const q = encodeURIComponent(GNEWS_TOPICS[topic].q);
-  const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&apikey=${apiKey}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-  if (!res.ok) throw new Error(`GNews HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.errors) throw new Error(json.errors.join(", "));
-  if (!json.articles?.length) throw new Error("No articles returned.");
-  return json.articles.map(a => ({
-    title: a.title,
-    link: a.url,
-    pubDate: a.publishedAt,
-    description: a.description || "",
-    thumbnail: a.image || null,
-    source: a.source?.name || "",
-  }));
+  // ① rss2json
+  try {
+    const r = await fetch(
+      `https://api.rss2json.com/v1/api.json?rss_url=${encoded}&count=10`,
+      { signal: AbortSignal.timeout(7000) }
+    );
+    const d = await r.json();
+    if (d.status === "ok" && d.items?.length) {
+      return d.items.map(i => ({
+        title: i.title,
+        link: i.link,
+        pubDate: i.pubDate,
+        description: (i.description||"").replace(/<[^>]*>/g,""),
+        thumbnail: i.thumbnail || i.enclosure?.link || null,
+      }));
+    }
+  } catch {}
+
+  // ② corsproxy.io + raw XML parse
+  try {
+    const r = await fetch(
+      `https://corsproxy.io/?${encoded}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const xml = await r.text();
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+    const items = [...doc.querySelectorAll("item")].slice(0, 10);
+    if (items.length) {
+      return items.map(item => ({
+        title: item.querySelector("title")?.textContent || "",
+        link: item.querySelector("link")?.textContent || item.querySelector("guid")?.textContent || "#",
+        pubDate: item.querySelector("pubDate")?.textContent || "",
+        description: (item.querySelector("description")?.textContent || "").replace(/<[^>]*>/g,""),
+        thumbnail: item.querySelector("enclosure")?.getAttribute("url") || null,
+      }));
+    }
+  } catch {}
+
+  // ③ allorigins + raw XML parse
+  try {
+    const r = await fetch(
+      `https://api.allorigins.win/raw?url=${encoded}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const xml = await r.text();
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+    const items = [...doc.querySelectorAll("item")].slice(0, 10);
+    if (items.length) {
+      return items.map(item => ({
+        title: item.querySelector("title")?.textContent || "",
+        link: item.querySelector("link")?.textContent || "#",
+        pubDate: item.querySelector("pubDate")?.textContent || "",
+        description: (item.querySelector("description")?.textContent || "").replace(/<[^>]*>/g,""),
+        thumbnail: null,
+      }));
+    }
+  } catch {}
+
+  throw new Error("All RSS services unavailable. Check your internet connection.");
 }
 
 // ─── EIA FETCH ────────────────────────────────────────────────────
@@ -681,77 +721,65 @@ const MapSection = () => {
 };
 
 // ─── NEWS (multi-fallback RSS) ────────────────────────────────────
-const News = ({ apiKeys }) => {
-  const [topic, setTopic] = useState("solar");
+const RSS_SOURCES = {
+  cleantechnica: { label:"CleanTechnica", url:"https://cleantechnica.com/feed/", color:T.green },
+  pvmagazine:    { label:"PV Magazine",   url:"https://www.pv-magazine.com/feed/", color:T.yellow },
+  recharge:      { label:"Recharge News", url:"https://www.rechargenews.com/rss", color:T.cyan },
+};
+
+const News = () => {
+  const [source, setSource] = useState("cleantechnica");
   const [articles, setArticles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const hasKey = !!apiKeys?.gnews;
 
-  const load = useCallback(async (t) => {
-    if (!apiKeys?.gnews) return;
+  const load = useCallback(async (src) => {
     setLoading(true); setError(null); setArticles([]);
     try {
-      const items = await fetchGNews(t, apiKeys.gnews);
+      const items = await fetchRSSFeed(RSS_SOURCES[src].url);
       setArticles(items);
-    } catch (e) { setError(e.message); }
+    } catch (e) {
+      setError(e.message);
+    }
     setLoading(false);
-  }, [apiKeys?.gnews]);
+  }, []);
 
-  useEffect(() => { if (hasKey) load(topic); }, [topic, hasKey]);
+  useEffect(() => { load(source); }, [source]);
 
-  const col = GNEWS_TOPICS[topic].color;
+  const col = RSS_SOURCES[source].color;
   const fmtDate = d => d ? new Date(d).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "";
 
   return (
     <div className="fade-up">
-      <SectionHeader title="NEWS" subtitle="Live green energy headlines powered by GNews API" />
-
-      {!hasKey && (
-        <div style={{ background:T.yellowDim, border:`1px solid ${T.yellow}44`,
-          borderRadius:10, padding:"20px 24px", marginBottom:20,
-          display:"flex", gap:14, alignItems:"center" }}>
-          <span style={{ fontSize:20 }}>🔑</span>
-          <div>
-            <Sans size={14} weight={500} color={T.yellow} style={{ display:"block", marginBottom:4 }}>
-              GNews API Key Required
-            </Sans>
-            <Sans size={12} color={T.sub} style={{ display:"block" }}>
-              Add your free GNews key in Settings to load live headlines.
-              Get one free at gnews.io — 100 requests/day.
-            </Sans>
-          </div>
-        </div>
-      )}
-
-      <div style={{ display:"flex", gap:8, marginBottom:20, flexWrap:"wrap" }}>
-        {Object.entries(GNEWS_TOPICS).map(([k,v]) => (
-          <button key={k} onClick={() => setTopic(k)} style={{
-            background:topic===k?v.color+"1a":"transparent",
-            border:`1px solid ${topic===k?v.color:T.border}`,
-            color:topic===k?v.color:T.muted,
+      <SectionHeader title="NEWS" subtitle="Live green energy headlines via RSS — no API key required" />
+      <div style={{ display:"flex", gap:8, marginBottom:20 }}>
+        {Object.entries(RSS_SOURCES).map(([k,v]) => (
+          <button key={k} onClick={() => setSource(k)} style={{
+            background:source===k?v.color+"1a":"transparent",
+            border:`1px solid ${source===k?v.color:T.border}`,
+            color:source===k?v.color:T.muted,
             padding:"8px 18px", borderRadius:7, fontFamily:"IBM Plex Mono",
             fontSize:12, cursor:"pointer", transition:"all .2s" }}>
             {v.label}
           </button>
         ))}
-        <button onClick={() => load(topic)} disabled={loading || !hasKey}
+        <button onClick={() => load(source)} disabled={loading}
           style={{ marginLeft:"auto", background:col+"1a", border:`1px solid ${col}55`,
             color:col, padding:"8px 14px", borderRadius:7, fontFamily:"IBM Plex Mono",
-            fontSize:12, cursor:(loading||!hasKey)?"not-allowed":"pointer",
-            display:"flex", gap:6, alignItems:"center", opacity:!hasKey?0.4:1 }}>
+            fontSize:12, cursor:loading?"not-allowed":"pointer",
+            display:"flex", gap:6, alignItems:"center" }}>
           {loading ? <><Spinner size={11} color={col} /> Loading…</> : "↻ Refresh"}
         </button>
       </div>
-
       {error && <ErrorBanner msg={error} color={T.red} />}
-      {loading && (
-        <div style={{ display:"flex", justifyContent:"center", alignItems:"center", height:180, gap:12 }}>
+      {loading && !error && (
+        <div style={{ display:"flex", justifyContent:"center", alignItems:"center",
+          height:180, gap:12 }}>
           <Spinner color={col} size={20} />
-          <Mono color={T.muted}>Fetching headlines…</Mono>
+          <Mono color={T.muted}>Fetching feed<span style={{ animation:"blink 1s infinite", display:"inline" }}>_</span></Mono>
         </div>
       )}
-      {!loading && !error && hasKey && articles.length === 0 && (
+      {!loading && !error && articles.length === 0 && (
         <div style={{ textAlign:"center", padding:48 }}>
           <Mono color={T.muted}>No articles found.</Mono>
         </div>
@@ -759,7 +787,7 @@ const News = ({ apiKeys }) => {
       {!loading && articles.length > 0 && (
         <div style={{ display:"grid", gap:10 }}>
           {articles.map((a,i) => (
-            <a key={i} href={a.link} target="_blank" rel="noopener noreferrer" style={{ textDecoration:"none" }}>
+            <a key={i} href={a.link} target="_blank" rel="noopener noreferrer">
               <div className="card fade-up" style={{ padding:"15px 20px", display:"flex",
                 gap:14, alignItems:"flex-start", animationDelay:`${i*35}ms`,
                 cursor:"pointer", transition:"border-color .2s" }}
@@ -767,7 +795,8 @@ const News = ({ apiKeys }) => {
                 onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
                 {a.thumbnail && (
                   <img src={a.thumbnail} alt="" style={{ width:70, height:48,
-                    objectFit:"cover", borderRadius:5, flexShrink:0, border:`1px solid ${T.border}` }}
+                    objectFit:"cover", borderRadius:5, flexShrink:0,
+                    border:`1px solid ${T.border}` }}
                     onError={e => e.target.style.display="none"} />
                 )}
                 <div style={{ flex:1, minWidth:0 }}>
@@ -779,10 +808,7 @@ const News = ({ apiKeys }) => {
                       {a.description.slice(0,150)}…
                     </Mono>
                   )}
-                  <div style={{ display:"flex", gap:12, alignItems:"center" }}>
-                    <Mono size={10} color={col}>{fmtDate(a.pubDate)}</Mono>
-                    {a.source && <Mono size={10} color={T.muted}>· {a.source}</Mono>}
-                  </div>
+                  <Mono size={10} color={col}>{fmtDate(a.pubDate)}</Mono>
                 </div>
                 <Sans size={16} color={T.muted} style={{ flexShrink:0 }}>→</Sans>
               </div>
@@ -819,9 +845,6 @@ const Settings = ({ apiKeys, setApiKeys }) => {
       } else if (key === "alphaVantage") {
         await fetchAV("FSLR", local.alphaVantage);
         setTestResults(r => ({ ...r, alphaVantage:{ ok:true, msg:"✓ Alpha Vantage connection successful!" } }));
-      } else if (key === "gnews") {
-        await fetchGNews("solar", local.gnews);
-        setTestResults(r => ({ ...r, gnews:{ ok:true, msg:"✓ GNews connection successful!" } }));
       }
     } catch(e) {
       setTestResults(r => ({ ...r, [key]:{ ok:false, msg:`✗ ${e.message}` } }));
@@ -836,9 +859,6 @@ const Settings = ({ apiKeys, setApiKeys }) => {
     { key:"alphaVantage", label:"Alpha Vantage API Key", color:T.cyan,
       hint:"Free tier: 25 req/day — alphavantage.co", link:"https://www.alphavantage.co/support/#api-key",
       desc:"Powers live stock quotes in the Markets section." },
-    { key:"gnews", label:"GNews API Key", color:T.purple,
-      hint:"Free tier: 100 req/day — gnews.io", link:"https://gnews.io",
-      desc:"Powers live green energy headlines in the News section." },
   ];
 
   return (
@@ -910,9 +930,9 @@ const Settings = ({ apiKeys, setApiKeys }) => {
         {[
           { label:"EIA API", desc:"US solar generation (monthly)", key:"eia", color:T.green },
           { label:"Alpha Vantage", desc:"Live equity quotes", key:"alphaVantage", color:T.cyan },
-          { label:"GNews API", desc:"Live green energy headlines", key:"gnews", color:T.purple },
+          { label:"RSS (multi-proxy)", desc:"CleanTechnica · PV Magazine · Recharge", key:null, color:T.yellow },
         ].map((s,i) => {
-          const active = !!local[s.key];
+          const active = s.key===null || !!local[s.key];
           return (
             <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
               padding:"12px 0", borderBottom:i<2?`1px solid ${T.dim}`:"none" }}>
@@ -946,20 +966,262 @@ const NAV = [
   { id:"settings",  icon:"⚙", label:"Settings" },
 ];
 
-// ─── APP ROOT ────────────────────────────────────────────────────
+// ─── APP ROOT
+// ─────────────────────────────────────────────────────────────────
+// GREENPULSE — AI DILIGENCE FOOTER
+// ─────────────────────────────────────────────────────────────────
+// Instructions:
+// 1. Copy the AI_Diligence_Statement_GreenPulse.pdf into your
+//    greenpulse/public/ folder (same level as src/)
+//
+// 2. In your App.jsx, find the <main> tag and replace it with
+//    the version below that includes the DiligenceFooter.
+//
+// 3. Paste the DiligenceFooter component anywhere before
+//    `export default function App()`
+// ─────────────────────────────────────────────────────────────────
+
+// ── STEP 1: Paste this component into App.jsx ────────────────────
+
+const DiligenceFooter = () => (
+  <div style={{
+    flexShrink: 0,
+    borderTop: "1px solid #162236",
+    background: "#08111e",
+    padding: "12px 36px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 16,
+  }}>
+    {/* Left — label */}
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div style={{
+        width: 6, height: 6, borderRadius: "50%",
+        background: "#00ff9d", boxShadow: "0 0 8px #00ff9d",
+      }} />
+      <span style={{
+        fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
+        letterSpacing: "0.08em",
+      }}>
+        Built with Claude Sonnet 4.6 · Anthropic
+      </span>
+    </div>
+
+    {/* Center — statement */}
+    <span style={{
+      fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
+      letterSpacing: "0.06em", textAlign: "center",
+    }}>
+      AI was used to build this dashboard. All outputs reviewed & approved by the author.
+    </span>
+
+    {/* Right — PDF link */}
+    <a
+      href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "flex", alignItems: "center", gap: 6, flexShrink: 0,
+        background: "#00ff9d18", border: "1px solid #00ff9d44",
+        borderRadius: 6, padding: "5px 14px", textDecoration: "none",
+        transition: "all 0.2s",
+      }}
+      onMouseEnter={e => {
+        e.currentTarget.style.background = "#00ff9d28";
+        e.currentTarget.style.borderColor = "#00ff9d88";
+      }}
+      onMouseLeave={e => {
+        e.currentTarget.style.background = "#00ff9d18";
+        e.currentTarget.style.borderColor = "#00ff9d44";
+      }}
+    >
+      <span style={{ fontSize: 12 }}>📄</span>
+      <span style={{
+        fontFamily: "'IBM Plex Mono'", fontSize: 11,
+        color: "#00ff9d", letterSpacing: "0.08em",
+      }}>
+        AI Diligence Statement ↗
+      </span>
+    </a>
+  </div>
+);
+
+// ── STEP 2: Replace your <main>...</main> block with this ─────────
+// Find this in App.jsx:
+//
+//   <main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
+//     ...topbar...
+//     ...content...
+//  
+<DiligenceFooter /> 
+</main>
+//
+// Replace it with:
+
+/*
+<main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
+  {/* Topbar */}
+  <div style={{ padding:"16px 36px", borderBottom:`1px solid ${T.border}`,
+    display:"flex", justifyContent:"space-between", alignItems:"center",
+    background:T.surface, flexShrink:0 }}>
+    <Orb size={13} color={T.sub} style={{ letterSpacing:"0.1em" }}>
+      {NAV.find(n => n.id===active)?.icon} {NAV.find(n => n.id===active)?.label}
+    </Orb>
+    <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+      <Mono size={11} color={T.muted}>{now}</Mono>
+      <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+        <div style={{ width:6, height:6, borderRadius:"50%", background:T.green,
+          boxShadow:`0 0 8px ${T.green}`, animation:"blink 2.5s ease-in-out infinite" }} />
+        <Mono size={9} color={T.green} style={{ letterSpacing:"0.12em" }}>LIVE</Mono>
+      </div>
+    </div>
+  </div>
+
+  {/* Content */}
+  <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
+    {renderSection()}
+  </div>
+
+  {/* ← ADD THIS LINE */}
+  <DiligenceFooter />
+
+</main>
+*/
+
+// ─────────────────────────────────────────────────────────────────
+// GREENPULSE — AI DILIGENCE FOOTER
+// ─────────────────────────────────────────────────────────────────
+// Instructions:
+// 1. Copy the AI_Diligence_Statement_GreenPulse.pdf into your
+//    greenpulse/public/ folder (same level as src/)
+//
+// 2. In your App.jsx, find the <main> tag and replace it with
+//    the version below that includes the DiligenceFooter.
+//
+// 3. Paste the DiligenceFooter component anywhere before
+//    `export default function App()`
+// ─────────────────────────────────────────────────────────────────
+
+// ── STEP 1: Paste this component into App.jsx ────────────────────
+
+const DiligenceFooter = () => (
+  <div style={{
+    flexShrink: 0,
+    borderTop: "1px solid #162236",
+    background: "#08111e",
+    padding: "12px 36px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 16,
+  }}>
+    {/* Left — label */}
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div style={{
+        width: 6, height: 6, borderRadius: "50%",
+        background: "#00ff9d", boxShadow: "0 0 8px #00ff9d",
+      }} />
+      <span style={{
+        fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
+        letterSpacing: "0.08em",
+      }}>
+        Built with Claude Sonnet 4.6 · Anthropic
+      </span>
+    </div>
+
+    {/* Center — statement */}
+    <span style={{
+      fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
+      letterSpacing: "0.06em", textAlign: "center",
+    }}>
+      AI was used to build this dashboard. All outputs reviewed & approved by the author.
+    </span>
+
+    {/* Right — PDF link */}
+    <a
+      href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "flex", alignItems: "center", gap: 6, flexShrink: 0,
+        background: "#00ff9d18", border: "1px solid #00ff9d44",
+        borderRadius: 6, padding: "5px 14px", textDecoration: "none",
+        transition: "all 0.2s",
+      }}
+      onMouseEnter={e => {
+        e.currentTarget.style.background = "#00ff9d28";
+        e.currentTarget.style.borderColor = "#00ff9d88";
+      }}
+      onMouseLeave={e => {
+        e.currentTarget.style.background = "#00ff9d18";
+        e.currentTarget.style.borderColor = "#00ff9d44";
+      }}
+    >
+      <span style={{ fontSize: 12 }}>📄</span>
+      <span style={{
+        fontFamily: "'IBM Plex Mono'", fontSize: 11,
+        color: "#00ff9d", letterSpacing: "0.08em",
+      }}>
+        AI Diligence Statement ↗
+      </span>
+    </a>
+  </div>
+);
+
+// ── STEP 2: Replace your <main>...</main> block with this ─────────
+// Find this in App.jsx:
+//
+//   <main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
+//     ...topbar...
+//     ...content...
+//   </main>
+//
+// Replace it with:
+
+/*
+<main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
+  {/* Topbar */}
+  <div style={{ padding:"16px 36px", borderBottom:`1px solid ${T.border}`,
+    display:"flex", justifyContent:"space-between", alignItems:"center",
+    background:T.surface, flexShrink:0 }}>
+    <Orb size={13} color={T.sub} style={{ letterSpacing:"0.1em" }}>
+      {NAV.find(n => n.id===active)?.icon} {NAV.find(n => n.id===active)?.label}
+    </Orb>
+    <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+      <Mono size={11} color={T.muted}>{now}</Mono>
+      <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+        <div style={{ width:6, height:6, borderRadius:"50%", background:T.green,
+          boxShadow:`0 0 8px ${T.green}`, animation:"blink 2.5s ease-in-out infinite" }} />
+        <Mono size={9} color={T.green} style={{ letterSpacing:"0.12em" }}>LIVE</Mono>
+      </div>
+    </div>
+  </div>
+
+  {/* Content */}
+  <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
+    {renderSection()}
+  </div>
+
+  {/* ← ADD THIS LINE */}
+  <DiligenceFooter />
+
+
+</main>
+*/
+
+ ────────────────────────────────────────────────────
 export default function App() {
   const [active, setActive] = useState("overview");
-  const [apiKeys, setApiKeys] = useState({ eia:"", alphaVantage:"", gnews:"" });
+  const [apiKeys, setApiKeys] = useState({ eia:"", alphaVantage:"" });
 
-  // Persist keys to localStorage so they survive hot-reloads
+  // Persist keys to sessionStorage so they survive hot-reloads
   useEffect(() => {
-    const saved = localStorage.getItem("gp_keys");
+    const saved = sessionStorage.getItem("gp_keys");
     if (saved) { try { setApiKeys(JSON.parse(saved)); } catch {} }
   }, []);
 
   const updateKeys = (keys) => {
     setApiKeys(keys);
-    localStorage.setItem("gp_keys", JSON.stringify(keys));
+    sessionStorage.setItem("gp_keys", JSON.stringify(keys));
   };
 
   const now = new Date().toLocaleDateString("en-US",
@@ -972,7 +1234,7 @@ export default function App() {
       case "hydrogen":  return <Hydrogen />;
       case "markets":   return <Markets   apiKeys={apiKeys} />;
       case "map":       return <MapSection />;
-      case "news":      return <News      apiKeys={apiKeys} />;
+      case "news":      return <News />;
       case "settings":  return <Settings  apiKeys={apiKeys} setApiKeys={updateKeys} />;
       default:          return <Overview  apiKeys={apiKeys} />;
     }
@@ -1010,7 +1272,7 @@ export default function App() {
           </nav>
           <div style={{ padding:"14px 18px", borderTop:`1px solid ${T.border}` }}>
             {["EIA","Alpha Vantage","RSS"].map((s,i) => {
-              const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Alpha Vantage"&&apiKeys.alphaVantage)||(s==="GNews"&&apiKeys.gnews);
+              const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Alpha Vantage"&&apiKeys.alphaVantage)||s==="RSS";
               return (
                 <div key={i} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
                   <div style={{ width:5, height:5, borderRadius:"50%",
@@ -1043,32 +1305,8 @@ export default function App() {
           <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
             {renderSection()}
           </div>
-          <DiligenceFooter />
         </main>
       </div>
     </>
   );
 }
-
-// ─── DILIGENCE FOOTER ─────────────────────────────────────────────
-const DiligenceFooter = () => (
-  <div style={{
-    flexShrink:0, borderTop:"1px solid #162236",
-    background:"#08111e", padding:"10px 36px",
-    display:"flex", justifyContent:"flex-end",
-    alignItems:"center",
-  }}>
-    <a href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"
-      target="_blank" rel="noopener noreferrer"
-      style={{ display:"flex", alignItems:"center", gap:6,
-        background:"#00ff9d18", border:"1px solid #00ff9d44",
-        borderRadius:6, padding:"5px 14px", textDecoration:"none",
-        transition:"all 0.2s" }}>
-      <span style={{ fontSize:12 }}>📄</span>
-      <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
-        color:"#00ff9d", letterSpacing:"0.08em" }}>
-        AI Diligence Statement ↗
-      </span>
-    </a>
-  </div>
-);
