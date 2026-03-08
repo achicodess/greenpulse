@@ -680,7 +680,7 @@ const MapSection = () => {
   );
 };
 
-// ─── NEWS (multi-fallback RSS) ────────────────────────────────────
+// ─── NEWS (GNews API) ────────────────────────────────────────────
 const News = ({ apiKeys }) => {
   const [topic, setTopic] = useState("solar");
   const [articles, setArticles] = useState([]);
@@ -1009,7 +1009,7 @@ export default function App() {
             ))}
           </nav>
           <div style={{ padding:"14px 18px", borderTop:`1px solid ${T.border}` }}>
-            {["EIA","Alpha Vantage","RSS"].map((s,i) => {
+            {["EIA","Alpha Vantage","GNews"].map((s,i) => {
               const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Alpha Vantage"&&apiKeys.alphaVantage)||(s==="GNews"&&apiKeys.gnews);
               return (
                 <div key={i} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
@@ -1067,7 +1067,7 @@ const DiligenceFooter = () => (
       <span style={{ fontSize:12 }}>📄</span>
       <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
         color:"#00ff9d", letterSpacing:"0.08em" }}>
-        AI Diligence Statement ↗
+         Diligence Statement ↗
       </span>
     </a>
   </div>
