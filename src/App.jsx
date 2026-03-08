@@ -149,10 +149,16 @@ async function fetchEIA(apiKey) {
   if (!json?.response?.data?.length) throw new Error("EIA returned no data — check your key.");
   return json.response.data
     .sort((a,b) => a.period.localeCompare(b.period))
-    .map(d => ({
-      m: new Date(d.period + "-01").toLocaleString("default", { month: "short" }),
-      gw: +(d.generation / 1000000).toFixed(2),
-    }));
+    .map(d => {
+      const raw = parseFloat(d.generation) || 0;
+      // EIA returns generation in thousand MWh — convert to GWh (divide by 1000)
+      // If values look like they are already in GWh range (>100), use as-is
+      const gw = raw > 10000 ? +(raw / 1000).toFixed(1) : raw > 0 ? +raw.toFixed(1) : 0;
+      return {
+        m: new Date(d.period + "-01").toLocaleString("default", { month: "short" }),
+        gw,
+      };
+    }).filter(d => d.gw > 0);
 }
 
 // ─── ALPHA VANTAGE FETCH ──────────────────────────────────────────
@@ -254,12 +260,19 @@ const ErrorBanner = ({ msg, color=T.yellow }) => (
 const Overview = ({ apiKeys }) => {
   const [solarData, setSolarData] = useState(FALLBACK_SOLAR);
   const [live, setLive] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!apiKeys.eia) { setSolarData(FALLBACK_SOLAR); setLive(false); return; }
+    setLoading(true);
     fetchEIA(apiKeys.eia)
-      .then(d => { setSolarData(d); setLive(true); })
-      .catch(() => { setSolarData(FALLBACK_SOLAR); setLive(false); });
+      .then(d => {
+        const valid = Array.isArray(d) && d.length > 0 && d.some(r => r.gw > 0);
+        if (valid) { setSolarData(d); setLive(true); }
+        else { setSolarData(FALLBACK_SOLAR); setLive(false); }
+      })
+      .catch(() => { setSolarData(FALLBACK_SOLAR); setLive(false); })
+      .finally(() => setLoading(false));
   }, [apiKeys.eia]);
 
   return (
@@ -333,7 +346,11 @@ const Solar = ({ apiKeys }) => {
     if (!apiKeys.eia) { setData(FALLBACK_SOLAR); setLive(false); setError(null); return; }
     setLoading(true); setError(null);
     fetchEIA(apiKeys.eia)
-      .then(d => { setData(d); setLive(true); })
+      .then(d => {
+        const valid = Array.isArray(d) && d.length > 0 && d.some(r => r.gw > 0);
+        if (valid) { setData(d); setLive(true); }
+        else { setData(FALLBACK_SOLAR); setLive(false); setError("EIA returned no usable data. Showing demo."); }
+      })
       .catch(e => { setError(e.message); setData(FALLBACK_SOLAR); setLive(false); })
       .finally(() => setLoading(false));
   }, [apiKeys.eia]);
@@ -1067,7 +1084,7 @@ const DiligenceFooter = () => (
       <span style={{ fontSize:12 }}>📄</span>
       <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
         color:"#00ff9d", letterSpacing:"0.08em" }}>
-         Diligence Statement ↗
+        Diligence Statement ↗
       </span>
     </a>
   </div>
