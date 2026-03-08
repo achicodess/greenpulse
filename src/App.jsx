@@ -1084,7 +1084,7 @@ const DiligenceFooter = () => (
       <span style={{ fontSize:12 }}>📄</span>
       <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
         color:"#00ff9d", letterSpacing:"0.08em" }}>
-        Diligence Statement ↗
+         Diligence Statement ↗
       </span>
     </a>
   </div>
