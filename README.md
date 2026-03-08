@@ -26,7 +26,7 @@
 
 ## What Is This
 
-GreenPulse is a dark-mode intelligence dashboard for the global green energy sector. It aggregates live data across three independent APIs: US solar generation from the EIA, real-time equity quotes from Finnhub, and green energy headlines from GNews — and renders them as interactive charts, maps, scorecards, and news feeds inside a fully client-side React application.
+GreenPulse is a dark-mode intelligence dashboard for the global green energy sector. It aggregates live data across three independent APIs: US solar generation from the EIA, real-time equity quotes from Finnhub, and green energy headlines from GNews and then renders them as interactive charts, maps, scorecards, and news feeds inside a fully client-side React application.
 
 No backend. No database. No server. Just a single `App.jsx` pulling live data directly from public APIs, built and deployed entirely on free-tier infrastructure.
 
@@ -51,7 +51,7 @@ No backend. No database. No server. Just a single `App.jsx` pulling live data di
 └─────────────────────────────────────────────────────────┘
 ```
 
-The entire application is a **single file** — `src/App.jsx` — containing all components, data fetching logic, static fallback datasets, and styling constants. No component library. No CSS files. No external state manager. Every style is inline, every animation is a CSS keyframe, every layout is flexbox or CSS grid — written from scratch.
+The entire application is a **single file** — `src/App.jsx`.It contains all components, data fetching logic, static fallback datasets, and styling constants. No component library, CSS files or an external state manager. Every style is inline, every animation is a CSS keyframe, every layout is flexbox or CSS grid. Every block is written from scratch.
 
 ---
 
@@ -110,7 +110,7 @@ All 8 tickers fetch in parallel. If any single ticker fails, only that card show
 ---
 
 ### 📰 GNews API
-**What it provides:** Live news articles matching topic queries — filtered to English, sorted by recency.
+**What it provides:** Live news articles matching topic queries — filtered to English, sorted by recency and relavence. 
 
 **Why GNews over RSS:** Three separate RSS feed proxies were attempted — `rss2json`, `corsproxy.io`, and `allorigins.win` — all of which proved inconsistent in production due to CORS policy changes, proxy rate limiting, and feed format inconsistencies across sources. GNews is a direct, stable REST API with 100 free requests per day and consistent JSON responses.
 
@@ -254,7 +254,7 @@ greenpulse/
 
 ## Deployment
 
-Deployed on **Netlify** via GitHub integration. Every `git push` to `main` triggers an automatic redeploy in ~45 seconds.
+Deployed on **Netlify** and **Vercel** via GitHub integration. Every `git push` to `main` triggers an automatic redeploy in ~45 seconds or a minute. 
 
 ```bash
 # Production build
@@ -268,7 +268,7 @@ Compatible with Netlify, Vercel, GitHub Pages, Cloudflare Pages.
 
 ## AI Diligence
 
-This project was built in collaboration with **Claude Sonnet 4.6** by Anthropic. The [full AI Diligence Statement](https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf) documents exactly how AI was used, how every output was reviewed, and who is responsible for the final product.
+This project was built in collaboration with Artificial Intelligence Systems. The [full AI Diligence Statement](https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf) documents exactly how AI was used, how every output was reviewed, and who is responsible for the final product.
 
 All decisions — architectural, aesthetic, and editorial — were made and approved by the project author. The AI was a tool. The project is the author's.
 
