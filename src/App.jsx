@@ -1172,7 +1172,7 @@ export default function App() {
               <div style={{ width:28, height:28, borderRadius:8,
                 background:`linear-gradient(135deg,${T.green}33,${T.cyan}22)`,
                 border:`1px solid ${T.green}44`, display:"flex", alignItems:"center",
-                justifyContent:"center", fontSize:14 }}>⚡</div>
+                justifyContent:"center", fontSize:14 }}></div>
               <div>
                 <Orb size={15} weight={900} color={T.green} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>GREEN</Orb>
                 <Orb size={13} weight={900} color={T.cyan} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>PULSE</Orb>
