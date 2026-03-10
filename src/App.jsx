@@ -49,11 +49,15 @@ const validateKey = {
   gnews:   k => typeof k === "string" && k.length >= 10,
 };
 
-// 6. Secure key storage — encode keys before writing, decode on read
+// 6. Secure key storage — versioned to avoid base64 ambiguity on migration
+const KEY_VERSION = "v2";
 function saveKeys(keys) {
   try {
-    const encoded = Object.fromEntries(Object.entries(keys).map(([k,v]) => [k, _enc(v)]));
-    localStorage.setItem("gp_keys", JSON.stringify(encoded));
+    const payload = {
+      _v: KEY_VERSION,
+      ...Object.fromEntries(Object.entries(keys).map(([k,v]) => [k, _enc(v)]))
+    };
+    localStorage.setItem("gp_keys", JSON.stringify(payload));
   } catch {}
 }
 function loadKeys() {
@@ -61,13 +65,15 @@ function loadKeys() {
     const raw = localStorage.getItem("gp_keys");
     if (!raw) return { eia:"", finnhub:"", gnews:"" };
     const parsed = JSON.parse(raw);
-    // Handle both old plain-text format and new encoded format
-    return Object.fromEntries(
-      Object.entries(parsed).map(([k,v]) => {
-        const decoded = _dec(v);
-        return [k, decoded || v]; // fallback to raw if decode fails (migration)
-      })
-    );
+    // If version flag present, keys are encoded — decode them
+    // If no version flag, keys are plain text from old format — use as-is
+    const isEncoded = parsed._v === KEY_VERSION;
+    const keys = { eia:"", finnhub:"", gnews:"" };
+    for (const k of ["eia","finnhub","gnews"]) {
+      if (!parsed[k]) continue;
+      keys[k] = isEncoded ? (_dec(parsed[k]) || "") : parsed[k];
+    }
+    return keys;
   } catch { return { eia:"", finnhub:"", gnews:"" }; }
 }
 
@@ -101,9 +107,7 @@ const FontLoader = () => (
     .fade-up{animation:fadeUp .4s cubic-bezier(.22,.68,0,1.2) both}
     .card{background:#0e1c2f;border:1px solid #162236;border-radius:10px;transition:border-color .2s}
     .card:hover{border-color:#1e3a5f}
-    .nav-btn{border:none;background:transparent;width:100%;text-align:left;cursor:pointer;border-radius:7px;border-left:2px solid transparent;transition:all .18s}
-    .nav-btn:hover{background:#00ff9d0d}
-    .nav-btn.active{background:#00ff9d12;border-left-color:#00ff9d}
+    .nav-btn{border:none;background:transparent;width:100%;text-align:left;cursor:pointer;border-radius:7px;transition:all .18s}
     button:active{transform:scale(.97)}
     input:focus{outline:none}
   `}</style>
@@ -119,11 +123,18 @@ const T = {
 const CC = [T.green,T.cyan,T.yellow,T.purple,"#f97316",T.muted];
 
 // ─── STATIC DATA ──────────────────────────────────────────────────
-const FALLBACK_SOLAR = [
-  {m:"Jan",gw:12.4},{m:"Feb",gw:14.1},{m:"Mar",gw:18.7},{m:"Apr",gw:24.3},
-  {m:"May",gw:31.2},{m:"Jun",gw:38.6},{m:"Jul",gw:41.3},{m:"Aug",gw:39.8},
-  {m:"Sep",gw:33.1},{m:"Oct",gw:25.4},{m:"Nov",gw:17.9},{m:"Dec",gw:13.2},
-];
+// Dynamic fallback — always ends on current month, rolling 12 months
+const SOLAR_BASE = [12.4,14.1,18.7,24.3,31.2,38.6,41.3,39.8,33.1,25.4,17.9,13.2];
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function makeFallbackSolar() {
+  const now = new Date();
+  const currentMonth = now.getMonth(); // 0-indexed
+  return Array.from({ length:12 }, (_,i) => {
+    const monthIdx = (currentMonth - 11 + i + 12) % 12;
+    return { m: MONTHS_SHORT[monthIdx], gw: SOLAR_BASE[monthIdx] };
+  });
+}
+const FALLBACK_SOLAR = makeFallbackSolar();
 const H2_INV = [
   {q:"Q1'23",b:6.3},{q:"Q2'23",b:8.1},{q:"Q3'23",b:10.4},{q:"Q4'23",b:12.8},
   {q:"Q1'24",b:14.2},{q:"Q2'24",b:17.6},{q:"Q3'24",b:20.3},{q:"Q4'24",b:24.1},
@@ -192,18 +203,21 @@ const GNEWS_TOPICS = {
 };
 
 async function fetchGNews(topic, apiKey) {
-  if (!validateKey.gnews(apiKey)) throw new Error("Invalid GNews API key format.");
+  const trimmedKey = (apiKey || "").trim();
+  if (!validateKey.gnews(trimmedKey)) throw new Error("Invalid GNews API key — check Settings.");
   const cacheKey = `gnews_${topic}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
   return dedupe(cacheKey, async () => {
     const q = encodeURIComponent(GNEWS_TOPICS[topic].q);
-    const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&apikey=${apiKey}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) throw new Error(`GNews HTTP ${res.status}`);
+    const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&token=${trimmedKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (res.status === 403) throw new Error("GNews API key invalid or expired. Re-enter in Settings.");
+    if (res.status === 429) throw new Error("GNews rate limit reached (100/day). Try again tomorrow.");
+    if (!res.ok) throw new Error(`GNews error (HTTP ${res.status}). Try refreshing.`);
     const json = await res.json();
-    if (json.errors) throw new Error(json.errors.join(", "));
-    if (!json.articles?.length) throw new Error("No articles returned.");
+    if (json.errors?.length) throw new Error(json.errors[0]);
+    if (!json.articles?.length) throw new Error("No articles found for this topic.");
     const articles = json.articles.map(a => sanitizeArticle({
       title: a.title, link: a.url, pubDate: a.publishedAt,
       description: a.description || "", thumbnail: a.image || null,
@@ -859,7 +873,22 @@ const News = ({ apiKeys }) => {
         </button>
       </div>
 
-      {error && <ErrorBanner msg={error} color={T.red} />}
+      {error && (
+        <div style={{ background:T.redDim, border:`1px solid ${T.red}44`,
+          borderRadius:10, padding:"16px 20px", marginBottom:16,
+          display:"flex", justifyContent:"space-between", alignItems:"center", gap:16 }}>
+          <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+            <span style={{ fontSize:16 }}>⚠</span>
+            <Sans size={13} color={T.red}>{error}</Sans>
+          </div>
+          <button onClick={() => load(topic)}
+            style={{ background:T.red+"22", border:`1px solid ${T.red}55`, color:T.red,
+              padding:"6px 14px", borderRadius:6, fontFamily:"IBM Plex Mono",
+              fontSize:11, cursor:"pointer", flexShrink:0 }}>
+            ↻ Retry
+          </button>
+        </div>
+      )}
       {loading && (
         <div style={{ display:"flex", justifyContent:"center", alignItems:"center", height:180, gap:12 }}>
           <Spinner color={col} size={20} />
@@ -1073,13 +1102,13 @@ const Settings = ({ apiKeys, setApiKeys }) => {
 
 // ─── NAV ─────────────────────────────────────────────────────────
 const NAV = [
-  { id:"overview",  icon:"◈", label:"Overview" },
-  { id:"solar",     icon:"☀", label:"Solar" },
-  { id:"hydrogen",  icon:"⬡", label:"Hydrogen" },
-  { id:"markets",   icon:"↗", label:"Markets" },
-  { id:"map",       icon:"◎", label:"Map" },
-  { id:"news",      icon:"◉", label:"News" },
-  { id:"settings",  icon:"⚙", label:"Settings" },
+  { id:"overview",  icon:"◈", label:"Overview",  color:"#00ff9d", glow:"#00ff9d" },
+  { id:"solar",     icon:"☀", label:"Solar",     color:"#fbbf24", glow:"#fbbf24" },
+  { id:"hydrogen",  icon:"⬡", label:"Hydrogen",  color:"#22d3ee", glow:"#22d3ee" },
+  { id:"markets",   icon:"↗", label:"Markets",   color:"#a78bfa", glow:"#a78bfa" },
+  { id:"map",       icon:"◎", label:"Map",       color:"#f97316", glow:"#f97316" },
+  { id:"news",      icon:"◉", label:"News",      color:"#f43f5e", glow:"#f43f5e" },
+  { id:"settings",  icon:"⚙", label:"Settings",  color:"#64748b", glow:"#94a3b8" },
 ];
 
 // ─── APP ROOT ────────────────────────────────────────────────────
@@ -1127,40 +1156,97 @@ export default function App() {
       <FontLoader />
       <div style={{ display:"flex", height:"100vh", background:T.bg, overflow:"hidden" }}>
         {/* Sidebar */}
-        <aside style={{ width:208, background:T.surface, borderRight:`1px solid ${T.border}`,
-          display:"flex", flexDirection:"column", flexShrink:0 }}>
-          <div style={{ padding:"22px 20px 18px", borderBottom:`1px solid ${T.border}` }}>
-            <Orb size={16} weight={900} color={T.green} style={{ display:"block", letterSpacing:"0.05em" }}>
-              GREEN
-            </Orb>
-            <Orb size={14} weight={900} color={T.cyan} style={{ display:"block", letterSpacing:"0.05em" }}>
-              PULSE
-            </Orb>
-            <Mono size={9} color={T.muted} style={{ marginTop:6, letterSpacing:"0.18em",
-              textTransform:"uppercase", display:"block" }}>Energy Intelligence</Mono>
+        <aside style={{ width:220, background:"linear-gradient(180deg,#07101e 0%,#050c18 100%)",
+          borderRight:`1px solid ${T.border}`, display:"flex", flexDirection:"column",
+          flexShrink:0, position:"relative", overflow:"hidden" }}>
+          {/* Ambient glow behind active item */}
+          <div style={{ position:"absolute", top:0, left:0, right:0, bottom:0, pointerEvents:"none",
+            background:`radial-gradient(ellipse 140% 60% at 50% ${
+              NAV.findIndex(n=>n.id===active)*14+10
+            }%, ${NAV.find(n=>n.id===active)?.color||T.green}08 0%, transparent 70%)`,
+            transition:"all 0.4s ease" }} />
+          {/* Logo */}
+          <div style={{ padding:"24px 20px 18px", borderBottom:`1px solid ${T.border}`,
+            position:"relative" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+              <div style={{ width:28, height:28, borderRadius:8,
+                background:`linear-gradient(135deg,${T.green}33,${T.cyan}22)`,
+                border:`1px solid ${T.green}44`, display:"flex", alignItems:"center",
+                justifyContent:"center", fontSize:14 }}>⚡</div>
+              <div>
+                <Orb size={15} weight={900} color={T.green} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>GREEN</Orb>
+                <Orb size={13} weight={900} color={T.cyan} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>PULSE</Orb>
+              </div>
+            </div>
+            <Mono size={9} color={T.muted} style={{ letterSpacing:"0.2em",
+              textTransform:"uppercase" }}>Energy Intelligence</Mono>
           </div>
-          <nav style={{ flex:1, padding:"12px 10px", overflowY:"auto" }}>
-            {NAV.map(item => (
-              <button key={item.id} onClick={() => setActive(item.id)}
-                className={`nav-btn${active===item.id?" active":""}`}
-                style={{ padding:"10px 12px", marginBottom:3,
-                  color:active===item.id?T.green:T.muted }}>
-                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                  <span style={{ fontSize:14, width:18, textAlign:"center" }}>{item.icon}</span>
-                  <Mono size={12} color="inherit" style={{ letterSpacing:"0.06em" }}>{item.label}</Mono>
-                </div>
-              </button>
-            ))}
-          </nav>
-          <div style={{ padding:"14px 18px", borderTop:`1px solid ${T.border}` }}>
-            {["EIA","Finnhub","GNews"].map((s,i) => {
-              const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Finnhub"&&apiKeys.finnhub)||(s==="GNews"&&apiKeys.gnews);
+          {/* Nav */}
+          <nav style={{ flex:1, padding:"10px 10px", overflowY:"auto" }}>
+            {NAV.map(item => {
+              const isActive = active === item.id;
               return (
-                <div key={i} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
-                  <div style={{ width:5, height:5, borderRadius:"50%",
-                    background:active_?T.green:T.muted,
-                    boxShadow:active_?`0 0 6px ${T.green}`:"none" }} />
-                  <Mono size={9} color={T.muted}>{s}</Mono>
+                <button key={item.id} onClick={() => setActive(item.id)}
+                  style={{ width:"100%", textAlign:"left", border:"none", cursor:"pointer",
+                    borderRadius:9, padding:"11px 14px", marginBottom:3,
+                    background: isActive ? item.color+"18" : "transparent",
+                    borderLeft: `2px solid ${isActive ? item.color : "transparent"}`,
+                    transition:"all 0.18s ease", position:"relative", overflow:"hidden" }}
+                  onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = item.color+"0d"; }}
+                  onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = "transparent"; }}>
+                  {isActive && (
+                    <div style={{ position:"absolute", inset:0, borderRadius:9,
+                      background:`linear-gradient(135deg,${item.color}10,transparent)`,
+                      pointerEvents:"none" }} />
+                  )}
+                  <div style={{ display:"flex", alignItems:"center", gap:10, position:"relative" }}>
+                    <div style={{ width:28, height:28, borderRadius:7, flexShrink:0,
+                      background: isActive ? item.color+"25" : item.color+"10",
+                      border: `1px solid ${isActive ? item.color+"66" : item.color+"22"}`,
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                      fontSize:13, transition:"all 0.18s",
+                      boxShadow: isActive ? `0 0 12px ${item.color}44` : "none" }}>
+                      <span style={{ filter: isActive ? `drop-shadow(0 0 4px ${item.color})` : "none" }}>
+                        {item.icon}
+                      </span>
+                    </div>
+                    <Mono size={12} color={isActive ? item.color : T.muted}
+                      style={{ letterSpacing:"0.06em", fontWeight: isActive ? 500 : 400,
+                        transition:"color 0.18s" }}>
+                      {item.label}
+                    </Mono>
+                    {isActive && (
+                      <div style={{ marginLeft:"auto", width:5, height:5, borderRadius:"50%",
+                        background:item.color, boxShadow:`0 0 8px ${item.color}` }} />
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </nav>
+          {/* API Status */}
+          <div style={{ padding:"14px 16px", borderTop:`1px solid ${T.border}` }}>
+            <Mono size={9} color={T.muted} style={{ letterSpacing:"0.14em",
+              textTransform:"uppercase", display:"block", marginBottom:8 }}>Data Sources</Mono>
+            {[
+              { label:"EIA", key:"eia", color:T.green },
+              { label:"Finnhub", key:"finnhub", color:"#a78bfa" },
+              { label:"GNews", key:"gnews", color:"#f43f5e" },
+            ].map((s,i) => {
+              const on = !!apiKeys[s.key];
+              return (
+                <div key={i} style={{ display:"flex", alignItems:"center",
+                  justifyContent:"space-between", marginBottom:5 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <div style={{ width:5, height:5, borderRadius:"50%",
+                      background: on ? s.color : T.muted,
+                      boxShadow: on ? `0 0 6px ${s.color}` : "none",
+                      transition:"all 0.3s" }} />
+                    <Mono size={9} color={on ? s.color : T.muted}
+                      style={{ transition:"color 0.3s" }}>{s.label}</Mono>
+                  </div>
+                  <Mono size={8} color={on ? s.color : T.muted}
+                    style={{ letterSpacing:"0.1em" }}>{on?"LIVE":"OFF"}</Mono>
                 </div>
               );
             })}
@@ -1172,9 +1258,15 @@ export default function App() {
           <div style={{ padding:"16px 36px", borderBottom:`1px solid ${T.border}`,
             display:"flex", justifyContent:"space-between", alignItems:"center",
             background:T.surface, flexShrink:0 }}>
-            <Orb size={13} color={T.sub} style={{ letterSpacing:"0.1em" }}>
-              {NAV.find(n => n.id===active)?.icon} {NAV.find(n => n.id===active)?.label}
-            </Orb>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:14, filter:`drop-shadow(0 0 6px ${NAV.find(n=>n.id===active)?.color||T.green})` }}>
+                {NAV.find(n => n.id===active)?.icon}
+              </span>
+              <Orb size={13} color={NAV.find(n=>n.id===active)?.color||T.sub}
+                style={{ letterSpacing:"0.1em" }}>
+                {NAV.find(n => n.id===active)?.label}
+              </Orb>
+            </div>
             <div style={{ display:"flex", alignItems:"center", gap:14 }}>
               <Mono size={11} color={T.muted}>{now}</Mono>
               <div style={{ display:"flex", alignItems:"center", gap:5 }}>
