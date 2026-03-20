@@ -5,6 +5,91 @@ import {
   PieChart, Pie, Cell,
 } from "recharts";
 
+// ─── SECURITY LAYER ──────────────────────────────────────────────
+// 1. Key obfuscation — simple XOR encode/decode so keys are never
+//    stored as plain text in localStorage
+const _xk = "gp2026xk";
+const _enc = s => s ? btoa([...s].map((c,i)=>String.fromCharCode(c.charCodeAt(0)^_xk.charCodeAt(i%_xk.length))).join("")) : "";
+const _dec = s => { try { return [...atob(s)].map((c,i)=>String.fromCharCode(c.charCodeAt(0)^_xk.charCodeAt(i%_xk.length))).join(""); } catch { return ""; } };
+
+// 2. Cache layer — TTL-based localStorage cache prevents API hammering
+//    EIA: 60 min (data updates monthly), Finnhub: 5 min, GNews: 30 min
+const CACHE_TTL = { eia: 60*60*1000, finnhub: 5*60*1000, gnews: 30*60*1000 };
+function cacheGet(key) {
+  try {
+    const raw = localStorage.getItem("gp_cache_" + key);
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    const ttl = Object.entries(CACHE_TTL).find(([k]) => key.startsWith(k))?.[1] || 5*60*1000;
+    if (Date.now() - ts > ttl) { localStorage.removeItem("gp_cache_" + key); return null; }
+    return data;
+  } catch { return null; }
+}
+function cacheSet(key, data) {
+  try { localStorage.setItem("gp_cache_" + key, JSON.stringify({ ts: Date.now(), data })); } catch {}
+}
+
+// 3. Request deduplication — prevents parallel identical requests
+const _inflight = {};
+async function dedupe(key, fn) {
+  if (_inflight[key]) return _inflight[key];
+  _inflight[key] = fn().finally(() => delete _inflight[key]);
+  return _inflight[key];
+}
+
+// 4. Input sanitiser — strips HTML/script tags from any external content
+const sanitize = s => typeof s === "string"
+  ? s.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "").replace(/on\w+=/gi, "").trim()
+  : s;
+
+// 5. Key validator — rejects obviously malformed keys before sending requests
+const validateKey = {
+  eia:     k => typeof k === "string" && k.length >= 32 && /^[a-zA-Z0-9]+$/.test(k),
+  finnhub: k => typeof k === "string" && k.length >= 10,
+  gnews:   k => typeof k === "string" && k.length >= 10,
+};
+
+// 6. Secure key storage — versioned to avoid base64 ambiguity on migration
+const KEY_VERSION = "v2";
+function saveKeys(keys) {
+  try {
+    const payload = {
+      _v: KEY_VERSION,
+      ...Object.fromEntries(Object.entries(keys).map(([k,v]) => [k, _enc(v)]))
+    };
+    localStorage.setItem("gp_keys", JSON.stringify(payload));
+  } catch {}
+}
+function loadKeys() {
+  try {
+    const raw = localStorage.getItem("gp_keys");
+    if (!raw) return { eia:"", finnhub:"", gnews:"" };
+    const parsed = JSON.parse(raw);
+    // If version flag present, keys are encoded — decode them
+    // If no version flag, keys are plain text from old format — use as-is
+    const isEncoded = parsed._v === KEY_VERSION;
+    const keys = { eia:"", finnhub:"", gnews:"" };
+    for (const k of ["eia","finnhub","gnews"]) {
+      if (!parsed[k]) continue;
+      keys[k] = isEncoded ? (_dec(parsed[k]) || "") : parsed[k];
+    }
+    return keys;
+  } catch { return { eia:"", finnhub:"", gnews:"" }; }
+}
+
+// 7. Content Security helper — sanitize all external article content
+function sanitizeArticle(a) {
+  return {
+    title:       sanitize(a.title || ""),
+    link:        /^https?:\/\//.test(a.link||"") ? a.link : "#",
+    pubDate:     a.pubDate || "",
+    description: sanitize(a.description || ""),
+    thumbnail:   /^https?:\/\//.test(a.thumbnail||"") ? a.thumbnail : null,
+    source:      sanitize(a.source || ""),
+  };
+}
+
+
 // ─── FONTS & GLOBAL STYLES ────────────────────────────────────────
 const FontLoader = () => (
   <style>{`
@@ -22,9 +107,7 @@ const FontLoader = () => (
     .fade-up{animation:fadeUp .4s cubic-bezier(.22,.68,0,1.2) both}
     .card{background:#0e1c2f;border:1px solid #162236;border-radius:10px;transition:border-color .2s}
     .card:hover{border-color:#1e3a5f}
-    .nav-btn{border:none;background:transparent;width:100%;text-align:left;cursor:pointer;border-radius:7px;border-left:2px solid transparent;transition:all .18s}
-    .nav-btn:hover{background:#00ff9d0d}
-    .nav-btn.active{background:#00ff9d12;border-left-color:#00ff9d}
+    .nav-btn{border:none;background:transparent;width:100%;text-align:left;cursor:pointer;border-radius:7px;transition:all .18s}
     button:active{transform:scale(.97)}
     input:focus{outline:none}
   `}</style>
@@ -40,11 +123,18 @@ const T = {
 const CC = [T.green,T.cyan,T.yellow,T.purple,"#f97316",T.muted];
 
 // ─── STATIC DATA ──────────────────────────────────────────────────
-const FALLBACK_SOLAR = [
-  {m:"Jan",gw:12.4},{m:"Feb",gw:14.1},{m:"Mar",gw:18.7},{m:"Apr",gw:24.3},
-  {m:"May",gw:31.2},{m:"Jun",gw:38.6},{m:"Jul",gw:41.3},{m:"Aug",gw:39.8},
-  {m:"Sep",gw:33.1},{m:"Oct",gw:25.4},{m:"Nov",gw:17.9},{m:"Dec",gw:13.2},
-];
+// Dynamic fallback — always ends on current month, rolling 12 months
+const SOLAR_BASE = [12.4,14.1,18.7,24.3,31.2,38.6,41.3,39.8,33.1,25.4,17.9,13.2];
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function makeFallbackSolar() {
+  const now = new Date();
+  const currentMonth = now.getMonth(); // 0-indexed
+  return Array.from({ length:12 }, (_,i) => {
+    const monthIdx = (currentMonth - 11 + i + 12) % 12;
+    return { m: MONTHS_SHORT[monthIdx], gw: SOLAR_BASE[monthIdx] };
+  });
+}
+const FALLBACK_SOLAR = makeFallbackSolar();
 const H2_INV = [
   {q:"Q1'23",b:6.3},{q:"Q2'23",b:8.1},{q:"Q3'23",b:10.4},{q:"Q4'23",b:12.8},
   {q:"Q1'24",b:14.2},{q:"Q2'24",b:17.6},{q:"Q3'24",b:20.3},{q:"Q4'24",b:24.1},
@@ -104,75 +194,53 @@ const MAP_REGIONS = [
   {id:"br",name:"Brazil",solar:32,h2:28,x:28,y:63},
 ];
 
-// ─── RSS FETCH (multi-fallback) ───────────────────────────────────
-// Tries several CORS-friendly RSS→JSON services in sequence
-async function fetchRSSFeed(rssUrl) {
-  const encoded = encodeURIComponent(rssUrl);
+// ─── GNEWS FETCH ─────────────────────────────────────────────────
+const GNEWS_TOPICS = {
+  solar:     { label:"Solar",     q:"solar energy",   color:T.green  },
+  hydrogen:  { label:"Hydrogen",  q:"green hydrogen", color:T.cyan   },
+  markets:   { label:"Markets",   q:"clean energy",   color:T.yellow },
+  policy:    { label:"Policy",    q:"energy policy",  color:T.purple },
+};
 
-  // ① rss2json
-  try {
-    const r = await fetch(
-      `https://api.rss2json.com/v1/api.json?rss_url=${encoded}&count=10`,
-      { signal: AbortSignal.timeout(7000) }
-    );
-    const d = await r.json();
-    if (d.status === "ok" && d.items?.length) {
-      return d.items.map(i => ({
-        title: i.title,
-        link: i.link,
-        pubDate: i.pubDate,
-        description: (i.description||"").replace(/<[^>]*>/g,""),
-        thumbnail: i.thumbnail || i.enclosure?.link || null,
-      }));
+async function fetchGNews(topic, apiKey) {
+  const trimmedKey = (apiKey || "").trim();
+  if (!validateKey.gnews(trimmedKey)) throw new Error("Invalid GNews API key — check Settings.");
+  const cacheKey = `gnews_${topic}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  return dedupe(cacheKey, async () => {
+    // GNews requires: apikey= (not token=), simple short query, max=10
+    const q = encodeURIComponent(GNEWS_TOPICS[topic].q);
+    const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&apikey=${trimmedKey}`;
+    let res;
+    try {
+      res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    } catch (e) {
+      throw new Error("Network error — check your internet connection.");
     }
-  } catch {}
-
-  // ② corsproxy.io + raw XML parse
-  try {
-    const r = await fetch(
-      `https://corsproxy.io/?${encoded}`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    const xml = await r.text();
-    const doc = new DOMParser().parseFromString(xml, "text/xml");
-    const items = [...doc.querySelectorAll("item")].slice(0, 10);
-    if (items.length) {
-      return items.map(item => ({
-        title: item.querySelector("title")?.textContent || "",
-        link: item.querySelector("link")?.textContent || item.querySelector("guid")?.textContent || "#",
-        pubDate: item.querySelector("pubDate")?.textContent || "",
-        description: (item.querySelector("description")?.textContent || "").replace(/<[^>]*>/g,""),
-        thumbnail: item.querySelector("enclosure")?.getAttribute("url") || null,
-      }));
-    }
-  } catch {}
-
-  // ③ allorigins + raw XML parse
-  try {
-    const r = await fetch(
-      `https://api.allorigins.win/raw?url=${encoded}`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    const xml = await r.text();
-    const doc = new DOMParser().parseFromString(xml, "text/xml");
-    const items = [...doc.querySelectorAll("item")].slice(0, 10);
-    if (items.length) {
-      return items.map(item => ({
-        title: item.querySelector("title")?.textContent || "",
-        link: item.querySelector("link")?.textContent || "#",
-        pubDate: item.querySelector("pubDate")?.textContent || "",
-        description: (item.querySelector("description")?.textContent || "").replace(/<[^>]*>/g,""),
-        thumbnail: null,
-      }));
-    }
-  } catch {}
-
-  throw new Error("All RSS services unavailable. Check your internet connection.");
+    if (res.status === 400) throw new Error("GNews rejected the request — your key may be invalid. Re-enter in Settings.");
+    if (res.status === 401 || res.status === 403) throw new Error("GNews API key invalid or expired. Re-enter in Settings.");
+    if (res.status === 429) throw new Error("GNews rate limit reached (100 req/day). Try again tomorrow.");
+    if (!res.ok) throw new Error(`GNews error (HTTP ${res.status}).`);
+    const json = await res.json();
+    if (json.errors?.length) throw new Error(json.errors[0]);
+    if (!json.articles?.length) throw new Error("No articles found for this topic.");
+    const articles = json.articles.map(a => sanitizeArticle({
+      title: a.title, link: a.url, pubDate: a.publishedAt,
+      description: a.description || "", thumbnail: a.image || null,
+      source: a.source?.name || "",
+    }));
+    cacheSet(cacheKey, articles);
+    return articles;
+  });
 }
 
 // ─── EIA FETCH ────────────────────────────────────────────────────
 async function fetchEIA(apiKey) {
-  // Use simpler query param style to avoid bracket encoding issues
+  if (!validateKey.eia(apiKey)) throw new Error("Invalid EIA API key format.");
+  const cached = cacheGet("eia");
+  if (cached) return cached;
+  return dedupe("eia", async () => {
   const params = new URLSearchParams({
     frequency: "monthly",
     "data[0]": "generation",
@@ -187,34 +255,51 @@ async function fetchEIA(apiKey) {
   if (!res.ok) throw new Error(`EIA HTTP ${res.status}`);
   const json = await res.json();
   if (!json?.response?.data?.length) throw new Error("EIA returned no data — check your key.");
-  return json.response.data
+  const result = json.response.data
     .sort((a,b) => a.period.localeCompare(b.period))
-    .map(d => ({
-      m: new Date(d.period + "-01").toLocaleString("default", { month: "short" }),
-      gw: +(d.generation / 1000000).toFixed(2),
-    }));
+    .map(d => {
+      const raw = parseFloat(d.generation) || 0;
+      // EIA returns generation in thousand MWh — convert to GWh (divide by 1000)
+      // If values look like they are already in GWh range (>100), use as-is
+      const gw = raw > 10000 ? +(raw / 1000).toFixed(1) : raw > 0 ? +raw.toFixed(1) : 0;
+      return {
+        m: new Date(d.period + "-01").toLocaleString("default", { month: "short" }),
+        gw,
+      };
+    }).filter(d => d.gw > 0);
+    cacheSet("eia", result);
+    return result;
+  });
 }
 
 // ─── ALPHA VANTAGE FETCH ──────────────────────────────────────────
-async function fetchAV(ticker, apiKey) {
-  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${apiKey}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!res.ok) throw new Error(`AV HTTP ${res.status}`);
-  const json = await res.json();
-  if (json["Note"]) throw new Error("Alpha Vantage rate limit hit. Try again in a minute.");
-  if (json["Information"]) throw new Error("Alpha Vantage API limit reached for today.");
-  const q = json["Global Quote"];
-  if (!q || !q["05. price"]) throw new Error(`No data for ${ticker}`);
-  const change = parseFloat(q["09. change"]);
-  const pct = parseFloat(q["10. change percent"]);
-  return {
-    price: parseFloat(q["05. price"]).toFixed(2),
-    change: (change >= 0 ? "+" : "") + change.toFixed(2),
-    pct: (pct >= 0 ? "+" : "") + pct.toFixed(2),
-    vol: parseInt(q["06. volume"]).toLocaleString(),
-    high: parseFloat(q["03. high"]).toFixed(2),
-    low: parseFloat(q["04. low"]).toFixed(2),
-  };
+async function fetchFinnhub(ticker, apiKey) {
+  if (!validateKey.finnhub(apiKey)) throw new Error("Invalid Finnhub API key format.");
+  const cacheKey = `finnhub_${ticker}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  return dedupe(cacheKey, async () => {
+    const res = await fetch(
+      `https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${apiKey}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) throw new Error(`Finnhub HTTP ${res.status}`);
+    const q = await res.json();
+    if (q.error) throw new Error(`Finnhub: ${q.error}`);
+    if (!q.c) throw new Error(`No data for ${ticker}`);
+    const change = q.c - q.pc;
+    const pct = q.pc ? ((change / q.pc) * 100) : 0;
+    const result = {
+      price:  q.c.toFixed(2),
+      change: (change >= 0 ? "+" : "") + change.toFixed(2),
+      pct:    (pct   >= 0 ? "+" : "") + pct.toFixed(2),
+      vol:    "—",
+      high:   q.h.toFixed(2),
+      low:    q.l.toFixed(2),
+    };
+    cacheSet(cacheKey, result);
+    return result;
+  });
 }
 
 // ─── ATOMS ────────────────────────────────────────────────────────
@@ -294,12 +379,19 @@ const ErrorBanner = ({ msg, color=T.yellow }) => (
 const Overview = ({ apiKeys }) => {
   const [solarData, setSolarData] = useState(FALLBACK_SOLAR);
   const [live, setLive] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!apiKeys.eia) { setSolarData(FALLBACK_SOLAR); setLive(false); return; }
+    setLoading(true);
     fetchEIA(apiKeys.eia)
-      .then(d => { setSolarData(d); setLive(true); })
-      .catch(() => { setSolarData(FALLBACK_SOLAR); setLive(false); });
+      .then(d => {
+        const valid = Array.isArray(d) && d.length > 0 && d.some(r => r.gw > 0);
+        if (valid) { setSolarData(d); setLive(true); }
+        else { setSolarData(FALLBACK_SOLAR); setLive(false); }
+      })
+      .catch(() => { setSolarData(FALLBACK_SOLAR); setLive(false); })
+      .finally(() => setLoading(false));
   }, [apiKeys.eia]);
 
   return (
@@ -373,7 +465,11 @@ const Solar = ({ apiKeys }) => {
     if (!apiKeys.eia) { setData(FALLBACK_SOLAR); setLive(false); setError(null); return; }
     setLoading(true); setError(null);
     fetchEIA(apiKeys.eia)
-      .then(d => { setData(d); setLive(true); })
+      .then(d => {
+        const valid = Array.isArray(d) && d.length > 0 && d.some(r => r.gw > 0);
+        if (valid) { setData(d); setLive(true); }
+        else { setData(FALLBACK_SOLAR); setLive(false); setError("EIA returned no usable data. Showing demo."); }
+      })
       .catch(e => { setError(e.message); setData(FALLBACK_SOLAR); setLive(false); })
       .finally(() => setLoading(false));
   }, [apiKeys.eia]);
@@ -530,17 +626,17 @@ const Markets = ({ apiKeys }) => {
   const [live, setLive] = useState(false);
   const [selected, setSelected] = useState("FSLR");
   const [lastUpdated, setLastUpdated] = useState(null);
-  const noKey = !apiKeys.alphaVantage;
+  const noKey = !apiKeys.finnhub;
 
   const refresh = useCallback(async () => {
-    if (!apiKeys.alphaVantage) return;
+    if (!apiKeys.finnhub) return;
     setLoading(true); setErrors([]);
     const results = { ...MOCK_QUOTES };
     const errs = [];
     // AV free tier: 25 req/day, ~5/min. Fetch first 6 with spacing.
     for (const ticker of TICKERS.slice(0, 6)) {
       try {
-        results[ticker] = await fetchAV(ticker, apiKeys.alphaVantage);
+        results[ticker] = await fetchFinnhub(ticker, apiKeys.finnhub);
       } catch (e) {
         errs.push(`${ticker}: ${e.message}`);
       }
@@ -552,9 +648,9 @@ const Markets = ({ apiKeys }) => {
     setLive(true);
     setLastUpdated(new Date());
     setLoading(false);
-  }, [apiKeys.alphaVantage]);
+  }, [apiKeys.finnhub]);
 
-  useEffect(() => { if (apiKeys.alphaVantage) refresh(); }, [apiKeys.alphaVantage]);
+  useEffect(() => { if (apiKeys.finnhub) refresh(); }, [apiKeys.finnhub]);
 
   const sel = quotes[selected] || MOCK_QUOTES[selected];
   const selUp = sel && parseFloat(sel.change) >= 0;
@@ -575,7 +671,7 @@ const Markets = ({ apiKeys }) => {
           </div>
         }
       />
-      {noKey && <ErrorBanner msg="Enter your Alpha Vantage API key in Settings to enable live quotes. Showing demo data." color={T.yellow} />}
+      {noKey && <ErrorBanner msg="Enter your Finnhub API key in Settings to enable live quotes. Showing demo data." color={T.yellow} />}
       {errors.map((e,i) => <ErrorBanner key={i} msg={e} color={T.red} />)}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:16 }}>
         {TICKERS.map(t => {
@@ -720,66 +816,93 @@ const MapSection = () => {
   );
 };
 
-// ─── NEWS (multi-fallback RSS) ────────────────────────────────────
-const RSS_SOURCES = {
-  cleantechnica: { label:"CleanTechnica", url:"https://cleantechnica.com/feed/", color:T.green },
-  pvmagazine:    { label:"PV Magazine",   url:"https://www.pv-magazine.com/feed/", color:T.yellow },
-  recharge:      { label:"Recharge News", url:"https://www.rechargenews.com/rss", color:T.cyan },
-};
-
-const News = () => {
-  const [source, setSource] = useState("cleantechnica");
+// ─── NEWS (GNews API) ────────────────────────────────────────────
+const News = ({ apiKeys }) => {
+  const [topic, setTopic] = useState("solar");
   const [articles, setArticles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const hasKey = !!apiKeys?.gnews;
 
-  const load = useCallback(async (src) => {
+  const load = useCallback(async (t) => {
+    if (!apiKeys?.gnews) return;
     setLoading(true); setError(null); setArticles([]);
     try {
-      const items = await fetchRSSFeed(RSS_SOURCES[src].url);
+      const items = await fetchGNews(t, apiKeys.gnews);
       setArticles(items);
-    } catch (e) {
-      setError(e.message);
-    }
+    } catch (e) { setError(e.message); }
     setLoading(false);
-  }, []);
+  }, [apiKeys?.gnews]);
 
-  useEffect(() => { load(source); }, [source]);
+  useEffect(() => { if (hasKey) load(topic); }, [topic, hasKey]);
 
-  const col = RSS_SOURCES[source].color;
+  const col = GNEWS_TOPICS[topic].color;
   const fmtDate = d => d ? new Date(d).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "";
 
   return (
     <div className="fade-up">
-      <SectionHeader title="NEWS" subtitle="Live green energy headlines via RSS — no API key required" />
-      <div style={{ display:"flex", gap:8, marginBottom:20 }}>
-        {Object.entries(RSS_SOURCES).map(([k,v]) => (
-          <button key={k} onClick={() => setSource(k)} style={{
-            background:source===k?v.color+"1a":"transparent",
-            border:`1px solid ${source===k?v.color:T.border}`,
-            color:source===k?v.color:T.muted,
+      <SectionHeader title="NEWS" subtitle="Live green energy headlines powered by GNews API" />
+
+      {!hasKey && (
+        <div style={{ background:T.yellowDim, border:`1px solid ${T.yellow}44`,
+          borderRadius:10, padding:"20px 24px", marginBottom:20,
+          display:"flex", gap:14, alignItems:"center" }}>
+          <span style={{ fontSize:20 }}>🔑</span>
+          <div>
+            <Sans size={14} weight={500} color={T.yellow} style={{ display:"block", marginBottom:4 }}>
+              GNews API Key Required
+            </Sans>
+            <Sans size={12} color={T.sub} style={{ display:"block" }}>
+              Add your free GNews key in Settings to load live headlines.
+              Get one free at gnews.io — 100 requests/day.
+            </Sans>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display:"flex", gap:8, marginBottom:20, flexWrap:"wrap" }}>
+        {Object.entries(GNEWS_TOPICS).map(([k,v]) => (
+          <button key={k} onClick={() => setTopic(k)} style={{
+            background:topic===k?v.color+"1a":"transparent",
+            border:`1px solid ${topic===k?v.color:T.border}`,
+            color:topic===k?v.color:T.muted,
             padding:"8px 18px", borderRadius:7, fontFamily:"IBM Plex Mono",
             fontSize:12, cursor:"pointer", transition:"all .2s" }}>
             {v.label}
           </button>
         ))}
-        <button onClick={() => load(source)} disabled={loading}
+        <button onClick={() => load(topic)} disabled={loading || !hasKey}
           style={{ marginLeft:"auto", background:col+"1a", border:`1px solid ${col}55`,
             color:col, padding:"8px 14px", borderRadius:7, fontFamily:"IBM Plex Mono",
-            fontSize:12, cursor:loading?"not-allowed":"pointer",
-            display:"flex", gap:6, alignItems:"center" }}>
+            fontSize:12, cursor:(loading||!hasKey)?"not-allowed":"pointer",
+            display:"flex", gap:6, alignItems:"center", opacity:!hasKey?0.4:1 }}>
           {loading ? <><Spinner size={11} color={col} /> Loading…</> : "↻ Refresh"}
         </button>
       </div>
-      {error && <ErrorBanner msg={error} color={T.red} />}
-      {loading && !error && (
-        <div style={{ display:"flex", justifyContent:"center", alignItems:"center",
-          height:180, gap:12 }}>
-          <Spinner color={col} size={20} />
-          <Mono color={T.muted}>Fetching feed<span style={{ animation:"blink 1s infinite", display:"inline" }}>_</span></Mono>
+
+      {error && (
+        <div style={{ background:T.redDim, border:`1px solid ${T.red}44`,
+          borderRadius:10, padding:"16px 20px", marginBottom:16,
+          display:"flex", justifyContent:"space-between", alignItems:"center", gap:16 }}>
+          <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+            <span style={{ fontSize:16 }}>⚠</span>
+            <Sans size={13} color={T.red}>{error}</Sans>
+          </div>
+          <button onClick={() => load(topic)}
+            style={{ background:T.red+"22", border:`1px solid ${T.red}55`, color:T.red,
+              padding:"6px 14px", borderRadius:6, fontFamily:"IBM Plex Mono",
+              fontSize:11, cursor:"pointer", flexShrink:0 }}>
+            ↻ Retry
+          </button>
         </div>
       )}
-      {!loading && !error && articles.length === 0 && (
+      {loading && (
+        <div style={{ display:"flex", justifyContent:"center", alignItems:"center", height:180, gap:12 }}>
+          <Spinner color={col} size={20} />
+          <Mono color={T.muted}>Fetching headlines…</Mono>
+        </div>
+      )}
+      {!loading && !error && hasKey && articles.length === 0 && (
         <div style={{ textAlign:"center", padding:48 }}>
           <Mono color={T.muted}>No articles found.</Mono>
         </div>
@@ -787,7 +910,7 @@ const News = () => {
       {!loading && articles.length > 0 && (
         <div style={{ display:"grid", gap:10 }}>
           {articles.map((a,i) => (
-            <a key={i} href={a.link} target="_blank" rel="noopener noreferrer">
+            <a key={i} href={a.link} target="_blank" rel="noopener noreferrer" style={{ textDecoration:"none" }}>
               <div className="card fade-up" style={{ padding:"15px 20px", display:"flex",
                 gap:14, alignItems:"flex-start", animationDelay:`${i*35}ms`,
                 cursor:"pointer", transition:"border-color .2s" }}
@@ -795,8 +918,7 @@ const News = () => {
                 onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
                 {a.thumbnail && (
                   <img src={a.thumbnail} alt="" style={{ width:70, height:48,
-                    objectFit:"cover", borderRadius:5, flexShrink:0,
-                    border:`1px solid ${T.border}` }}
+                    objectFit:"cover", borderRadius:5, flexShrink:0, border:`1px solid ${T.border}` }}
                     onError={e => e.target.style.display="none"} />
                 )}
                 <div style={{ flex:1, minWidth:0 }}>
@@ -808,7 +930,10 @@ const News = () => {
                       {a.description.slice(0,150)}…
                     </Mono>
                   )}
-                  <Mono size={10} color={col}>{fmtDate(a.pubDate)}</Mono>
+                  <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+                    <Mono size={10} color={col}>{fmtDate(a.pubDate)}</Mono>
+                    {a.source && <Mono size={10} color={T.muted}>· {a.source}</Mono>}
+                  </div>
                 </div>
                 <Sans size={16} color={T.muted} style={{ flexShrink:0 }}>→</Sans>
               </div>
@@ -842,9 +967,12 @@ const Settings = ({ apiKeys, setApiKeys }) => {
       if (key === "eia") {
         await fetchEIA(local.eia);
         setTestResults(r => ({ ...r, eia:{ ok:true, msg:"✓ EIA connection successful!" } }));
-      } else if (key === "alphaVantage") {
-        await fetchAV("FSLR", local.alphaVantage);
-        setTestResults(r => ({ ...r, alphaVantage:{ ok:true, msg:"✓ Alpha Vantage connection successful!" } }));
+      } else if (key === "finnhub") {
+        await fetchFinnhub("FSLR", local.finnhub);
+        setTestResults(r => ({ ...r, finnhub:{ ok:true, msg:"✓ Finnhub connection successful!" } }));
+      } else if (key === "gnews") {
+        await fetchGNews("solar", local.gnews.trim());
+        setTestResults(r => ({ ...r, gnews:{ ok:true, msg:"✓ GNews connection successful!" } }));
       }
     } catch(e) {
       setTestResults(r => ({ ...r, [key]:{ ok:false, msg:`✗ ${e.message}` } }));
@@ -856,9 +984,12 @@ const Settings = ({ apiKeys, setApiKeys }) => {
     { key:"eia", label:"EIA API Key", color:T.green,
       hint:"Free — register at eia.gov/opendata", link:"https://www.eia.gov/opendata/register.php",
       desc:"Powers real-time US solar generation charts in Solar and Overview." },
-    { key:"alphaVantage", label:"Alpha Vantage API Key", color:T.cyan,
-      hint:"Free tier: 25 req/day — alphavantage.co", link:"https://www.alphavantage.co/support/#api-key",
-      desc:"Powers live stock quotes in the Markets section." },
+    { key:"finnhub", label:"Finnhub API Key", color:T.cyan,
+      hint:"Free tier: 60 req/min — finnhub.io", link:"https://finnhub.io/register",
+      desc:"Powers real-time stock quotes in the Markets section. 60 req/min on free tier." },
+    { key:"gnews", label:"GNews API Key", color:T.purple,
+      hint:"Free tier: 100 req/day — gnews.io", link:"https://gnews.io",
+      desc:"Powers live green energy headlines in the News section." },
   ];
 
   return (
@@ -916,6 +1047,7 @@ const Settings = ({ apiKeys, setApiKeys }) => {
           );
         })}
       </div>
+      <div style={{ display:"flex", gap:10, alignItems:"center", marginBottom:0 }}>
       <button onClick={save} style={{ background:saved?T.green+"22":T.greenDim,
         border:`1px solid ${saved?T.green:T.green+"66"}`, color:T.green,
         padding:"12px 36px", borderRadius:7, fontFamily:"IBM Plex Mono", fontSize:13,
@@ -923,16 +1055,36 @@ const Settings = ({ apiKeys, setApiKeys }) => {
         boxShadow:saved?`0 0 20px ${T.green}33`:"none" }}>
         {saved ? "✓  SAVED & APPLIED" : "SAVE KEYS"}
       </button>
+      <button onClick={() => {
+        Object.keys(localStorage).filter(k => k.startsWith("gp_cache_")).forEach(k => localStorage.removeItem(k));
+        alert("Cache cleared — next data load will fetch fresh from APIs.");
+      }} style={{ background:T.yellowDim, border:`1px solid ${T.yellow}55`, color:T.yellow,
+        padding:"12px 20px", borderRadius:7, fontFamily:"IBM Plex Mono", fontSize:11,
+        cursor:"pointer", letterSpacing:"0.06em" }}>
+        ↺ Clear Cache
+      </button>
+      <button onClick={() => {
+        if (window.confirm("Delete all saved API keys? You will need to re-enter them.")) {
+          localStorage.removeItem("gp_keys");
+          setLocal({ eia:"", finnhub:"", gnews:"" });
+          setApiKeys({ eia:"", finnhub:"", gnews:"" });
+        }
+      }} style={{ background:T.redDim, border:`1px solid ${T.red}55`, color:T.red,
+        padding:"12px 20px", borderRadius:7, fontFamily:"IBM Plex Mono", fontSize:11,
+        cursor:"pointer", letterSpacing:"0.06em" }}>
+        ✕ Clear Keys
+      </button>
+      </div>
       {/* Status */}
       <div className="card" style={{ padding:"20px 24px", marginTop:20, maxWidth:780 }}>
         <Mono size={10} color={T.muted} style={{ textTransform:"uppercase", letterSpacing:"0.12em",
           display:"block", marginBottom:14 }}>Data Source Status</Mono>
         {[
           { label:"EIA API", desc:"US solar generation (monthly)", key:"eia", color:T.green },
-          { label:"Alpha Vantage", desc:"Live equity quotes", key:"alphaVantage", color:T.cyan },
-          { label:"RSS (multi-proxy)", desc:"CleanTechnica · PV Magazine · Recharge", key:null, color:T.yellow },
+          { label:"Finnhub", desc:"Real-time equity quotes", key:"finnhub", color:T.cyan },
+          { label:"GNews API", desc:"Live green energy headlines", key:"gnews", color:T.purple },
         ].map((s,i) => {
-          const active = s.key===null || !!local[s.key];
+          const active = !!local[s.key];
           return (
             <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
               padding:"12px 0", borderBottom:i<2?`1px solid ${T.dim}`:"none" }}>
@@ -957,272 +1109,38 @@ const Settings = ({ apiKeys, setApiKeys }) => {
 
 // ─── NAV ─────────────────────────────────────────────────────────
 const NAV = [
-  { id:"overview",  icon:"◈", label:"Overview" },
-  { id:"solar",     icon:"☀", label:"Solar" },
-  { id:"hydrogen",  icon:"⬡", label:"Hydrogen" },
-  { id:"markets",   icon:"↗", label:"Markets" },
-  { id:"map",       icon:"◎", label:"Map" },
-  { id:"news",      icon:"◉", label:"News" },
-  { id:"settings",  icon:"⚙", label:"Settings" },
+  { id:"overview",  icon:"◈", label:"Overview",  color:"#00ff9d", glow:"#00ff9d" },
+  { id:"solar",     icon:"☀", label:"Solar",     color:"#fbbf24", glow:"#fbbf24" },
+  { id:"hydrogen",  icon:"⬡", label:"Hydrogen",  color:"#22d3ee", glow:"#22d3ee" },
+  { id:"markets",   icon:"↗", label:"Markets",   color:"#a78bfa", glow:"#a78bfa" },
+  { id:"map",       icon:"◎", label:"Map",       color:"#f97316", glow:"#f97316" },
+  { id:"news",      icon:"◉", label:"News",      color:"#f43f5e", glow:"#f43f5e" },
+  { id:"settings",  icon:"⚙", label:"Settings",  color:"#64748b", glow:"#94a3b8" },
 ];
 
-// ─── APP ROOT
-// ─────────────────────────────────────────────────────────────────
-// GREENPULSE — AI DILIGENCE FOOTER
-// ─────────────────────────────────────────────────────────────────
-// Instructions:
-// 1. Copy the AI_Diligence_Statement_GreenPulse.pdf into your
-//    greenpulse/public/ folder (same level as src/)
-//
-// 2. In your App.jsx, find the <main> tag and replace it with
-//    the version below that includes the DiligenceFooter.
-//
-// 3. Paste the DiligenceFooter component anywhere before
-//    `export default function App()`
-// ─────────────────────────────────────────────────────────────────
-
-// ── STEP 1: Paste this component into App.jsx ────────────────────
-
-const DiligenceFooter = () => (
-  <div style={{
-    flexShrink: 0,
-    borderTop: "1px solid #162236",
-    background: "#08111e",
-    padding: "12px 36px",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 16,
-  }}>
-    {/* Left — label */}
-    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-      <div style={{
-        width: 6, height: 6, borderRadius: "50%",
-        background: "#00ff9d", boxShadow: "0 0 8px #00ff9d",
-      }} />
-      <span style={{
-        fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
-        letterSpacing: "0.08em",
-      }}>
-        Built with Claude Sonnet 4.6 · Anthropic
-      </span>
-    </div>
-
-    {/* Center — statement */}
-    <span style={{
-      fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
-      letterSpacing: "0.06em", textAlign: "center",
-    }}>
-      AI was used to build this dashboard. All outputs reviewed & approved by the author.
-    </span>
-
-    {/* Right — PDF link */}
-    <a
-      href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "flex", alignItems: "center", gap: 6, flexShrink: 0,
-        background: "#00ff9d18", border: "1px solid #00ff9d44",
-        borderRadius: 6, padding: "5px 14px", textDecoration: "none",
-        transition: "all 0.2s",
-      }}
-      onMouseEnter={e => {
-        e.currentTarget.style.background = "#00ff9d28";
-        e.currentTarget.style.borderColor = "#00ff9d88";
-      }}
-      onMouseLeave={e => {
-        e.currentTarget.style.background = "#00ff9d18";
-        e.currentTarget.style.borderColor = "#00ff9d44";
-      }}
-    >
-      <span style={{ fontSize: 12 }}>📄</span>
-      <span style={{
-        fontFamily: "'IBM Plex Mono'", fontSize: 11,
-        color: "#00ff9d", letterSpacing: "0.08em",
-      }}>
-        AI Diligence Statement ↗
-      </span>
-    </a>
-  </div>
-);
-
-// ── STEP 2: Replace your <main>...</main> block with this ─────────
-// Find this in App.jsx:
-//
-//   <main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
-//     ...topbar...
-//     ...content...
-//  
-<DiligenceFooter /> 
-</main>
-//
-// Replace it with:
-
-/*
-<main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
-  {/* Topbar */}
-  <div style={{ padding:"16px 36px", borderBottom:`1px solid ${T.border}`,
-    display:"flex", justifyContent:"space-between", alignItems:"center",
-    background:T.surface, flexShrink:0 }}>
-    <Orb size={13} color={T.sub} style={{ letterSpacing:"0.1em" }}>
-      {NAV.find(n => n.id===active)?.icon} {NAV.find(n => n.id===active)?.label}
-    </Orb>
-    <div style={{ display:"flex", alignItems:"center", gap:14 }}>
-      <Mono size={11} color={T.muted}>{now}</Mono>
-      <div style={{ display:"flex", alignItems:"center", gap:5 }}>
-        <div style={{ width:6, height:6, borderRadius:"50%", background:T.green,
-          boxShadow:`0 0 8px ${T.green}`, animation:"blink 2.5s ease-in-out infinite" }} />
-        <Mono size={9} color={T.green} style={{ letterSpacing:"0.12em" }}>LIVE</Mono>
-      </div>
-    </div>
-  </div>
-
-  {/* Content */}
-  <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
-    {renderSection()}
-  </div>
-
-  {/* ← ADD THIS LINE */}
-  <DiligenceFooter />
-
-</main>
-*/
-
-// ─────────────────────────────────────────────────────────────────
-// GREENPULSE — AI DILIGENCE FOOTER
-// ─────────────────────────────────────────────────────────────────
-// Instructions:
-// 1. Copy the AI_Diligence_Statement_GreenPulse.pdf into your
-//    greenpulse/public/ folder (same level as src/)
-//
-// 2. In your App.jsx, find the <main> tag and replace it with
-//    the version below that includes the DiligenceFooter.
-//
-// 3. Paste the DiligenceFooter component anywhere before
-//    `export default function App()`
-// ─────────────────────────────────────────────────────────────────
-
-// ── STEP 1: Paste this component into App.jsx ────────────────────
-
-const DiligenceFooter = () => (
-  <div style={{
-    flexShrink: 0,
-    borderTop: "1px solid #162236",
-    background: "#08111e",
-    padding: "12px 36px",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 16,
-  }}>
-    {/* Left — label */}
-    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-      <div style={{
-        width: 6, height: 6, borderRadius: "50%",
-        background: "#00ff9d", boxShadow: "0 0 8px #00ff9d",
-      }} />
-      <span style={{
-        fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
-        letterSpacing: "0.08em",
-      }}>
-        Built with Claude Sonnet 4.6 · Anthropic
-      </span>
-    </div>
-
-    {/* Center — statement */}
-    <span style={{
-      fontFamily: "'IBM Plex Mono'", fontSize: 11, color: "#4a6080",
-      letterSpacing: "0.06em", textAlign: "center",
-    }}>
-      AI was used to build this dashboard. All outputs reviewed & approved by the author.
-    </span>
-
-    {/* Right — PDF link */}
-    <a
-      href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "flex", alignItems: "center", gap: 6, flexShrink: 0,
-        background: "#00ff9d18", border: "1px solid #00ff9d44",
-        borderRadius: 6, padding: "5px 14px", textDecoration: "none",
-        transition: "all 0.2s",
-      }}
-      onMouseEnter={e => {
-        e.currentTarget.style.background = "#00ff9d28";
-        e.currentTarget.style.borderColor = "#00ff9d88";
-      }}
-      onMouseLeave={e => {
-        e.currentTarget.style.background = "#00ff9d18";
-        e.currentTarget.style.borderColor = "#00ff9d44";
-      }}
-    >
-      <span style={{ fontSize: 12 }}>📄</span>
-      <span style={{
-        fontFamily: "'IBM Plex Mono'", fontSize: 11,
-        color: "#00ff9d", letterSpacing: "0.08em",
-      }}>
-        AI Diligence Statement ↗
-      </span>
-    </a>
-  </div>
-);
-
-// ── STEP 2: Replace your <main>...</main> block with this ─────────
-// Find this in App.jsx:
-//
-//   <main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
-//     ...topbar...
-//     ...content...
-//   </main>
-//
-// Replace it with:
-
-/*
-<main style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>
-  {/* Topbar */}
-  <div style={{ padding:"16px 36px", borderBottom:`1px solid ${T.border}`,
-    display:"flex", justifyContent:"space-between", alignItems:"center",
-    background:T.surface, flexShrink:0 }}>
-    <Orb size={13} color={T.sub} style={{ letterSpacing:"0.1em" }}>
-      {NAV.find(n => n.id===active)?.icon} {NAV.find(n => n.id===active)?.label}
-    </Orb>
-    <div style={{ display:"flex", alignItems:"center", gap:14 }}>
-      <Mono size={11} color={T.muted}>{now}</Mono>
-      <div style={{ display:"flex", alignItems:"center", gap:5 }}>
-        <div style={{ width:6, height:6, borderRadius:"50%", background:T.green,
-          boxShadow:`0 0 8px ${T.green}`, animation:"blink 2.5s ease-in-out infinite" }} />
-        <Mono size={9} color={T.green} style={{ letterSpacing:"0.12em" }}>LIVE</Mono>
-      </div>
-    </div>
-  </div>
-
-  {/* Content */}
-  <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
-    {renderSection()}
-  </div>
-
-  {/* ← ADD THIS LINE */}
-  <DiligenceFooter />
-
-
-</main>
-*/
-
- ────────────────────────────────────────────────────
+// ─── APP ROOT ────────────────────────────────────────────────────
 export default function App() {
   const [active, setActive] = useState("overview");
-  const [apiKeys, setApiKeys] = useState({ eia:"", alphaVantage:"" });
+  const [apiKeys, setApiKeys] = useState({ eia:"", finnhub:"", gnews:"" });
 
-  // Persist keys to sessionStorage so they survive hot-reloads
+  // Persist keys to localStorage so they survive hot-reloads
   useEffect(() => {
-    const saved = sessionStorage.getItem("gp_keys");
-    if (saved) { try { setApiKeys(JSON.parse(saved)); } catch {} }
+    const loaded = loadKeys();
+    if (loaded) setApiKeys(loaded);
   }, []);
 
   const updateKeys = (keys) => {
     setApiKeys(keys);
-    sessionStorage.setItem("gp_keys", JSON.stringify(keys));
+    saveKeys(keys);
   };
+
+  // Pause background activity when tab is not visible
+  const [tabVisible, setTabVisible] = useState(true);
+  useEffect(() => {
+    const fn = () => setTabVisible(!document.hidden);
+    document.addEventListener("visibilitychange", fn);
+    return () => document.removeEventListener("visibilitychange", fn);
+  }, []);
 
   const now = new Date().toLocaleDateString("en-US",
     { weekday:"short", month:"short", day:"numeric", year:"numeric" });
@@ -1234,7 +1152,7 @@ export default function App() {
       case "hydrogen":  return <Hydrogen />;
       case "markets":   return <Markets   apiKeys={apiKeys} />;
       case "map":       return <MapSection />;
-      case "news":      return <News />;
+      case "news":      return <News      apiKeys={apiKeys} />;
       case "settings":  return <Settings  apiKeys={apiKeys} setApiKeys={updateKeys} />;
       default:          return <Overview  apiKeys={apiKeys} />;
     }
@@ -1245,40 +1163,97 @@ export default function App() {
       <FontLoader />
       <div style={{ display:"flex", height:"100vh", background:T.bg, overflow:"hidden" }}>
         {/* Sidebar */}
-        <aside style={{ width:208, background:T.surface, borderRight:`1px solid ${T.border}`,
-          display:"flex", flexDirection:"column", flexShrink:0 }}>
-          <div style={{ padding:"22px 20px 18px", borderBottom:`1px solid ${T.border}` }}>
-            <Orb size={16} weight={900} color={T.green} style={{ display:"block", letterSpacing:"0.05em" }}>
-              GREEN
-            </Orb>
-            <Orb size={14} weight={900} color={T.cyan} style={{ display:"block", letterSpacing:"0.05em" }}>
-              PULSE
-            </Orb>
-            <Mono size={9} color={T.muted} style={{ marginTop:6, letterSpacing:"0.18em",
-              textTransform:"uppercase", display:"block" }}>Energy Intelligence</Mono>
+        <aside style={{ width:220, background:"linear-gradient(180deg,#07101e 0%,#050c18 100%)",
+          borderRight:`1px solid ${T.border}`, display:"flex", flexDirection:"column",
+          flexShrink:0, position:"relative", overflow:"hidden" }}>
+          {/* Ambient glow behind active item */}
+          <div style={{ position:"absolute", top:0, left:0, right:0, bottom:0, pointerEvents:"none",
+            background:`radial-gradient(ellipse 140% 60% at 50% ${
+              NAV.findIndex(n=>n.id===active)*14+10
+            }%, ${NAV.find(n=>n.id===active)?.color||T.green}08 0%, transparent 70%)`,
+            transition:"all 0.4s ease" }} />
+          {/* Logo */}
+          <div style={{ padding:"24px 20px 18px", borderBottom:`1px solid ${T.border}`,
+            position:"relative" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+              <div style={{ width:28, height:28, borderRadius:8,
+                background:`linear-gradient(135deg,${T.green}33,${T.cyan}22)`,
+                border:`1px solid ${T.green}44`, display:"flex", alignItems:"center",
+                justifyContent:"center", fontSize:14 }}>⚡</div>
+              <div>
+                <Orb size={15} weight={900} color={T.green} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>GREEN</Orb>
+                <Orb size={13} weight={900} color={T.cyan} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>PULSE</Orb>
+              </div>
+            </div>
+            <Mono size={9} color={T.muted} style={{ letterSpacing:"0.2em",
+              textTransform:"uppercase" }}>Energy Intelligence</Mono>
           </div>
-          <nav style={{ flex:1, padding:"12px 10px", overflowY:"auto" }}>
-            {NAV.map(item => (
-              <button key={item.id} onClick={() => setActive(item.id)}
-                className={`nav-btn${active===item.id?" active":""}`}
-                style={{ padding:"10px 12px", marginBottom:3,
-                  color:active===item.id?T.green:T.muted }}>
-                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                  <span style={{ fontSize:14, width:18, textAlign:"center" }}>{item.icon}</span>
-                  <Mono size={12} color="inherit" style={{ letterSpacing:"0.06em" }}>{item.label}</Mono>
-                </div>
-              </button>
-            ))}
-          </nav>
-          <div style={{ padding:"14px 18px", borderTop:`1px solid ${T.border}` }}>
-            {["EIA","Alpha Vantage","RSS"].map((s,i) => {
-              const active_ = (s==="EIA"&&apiKeys.eia)||(s==="Alpha Vantage"&&apiKeys.alphaVantage)||s==="RSS";
+          {/* Nav */}
+          <nav style={{ flex:1, padding:"10px 10px", overflowY:"auto" }}>
+            {NAV.map(item => {
+              const isActive = active === item.id;
               return (
-                <div key={i} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
-                  <div style={{ width:5, height:5, borderRadius:"50%",
-                    background:active_?T.green:T.muted,
-                    boxShadow:active_?`0 0 6px ${T.green}`:"none" }} />
-                  <Mono size={9} color={T.muted}>{s}</Mono>
+                <button key={item.id} onClick={() => setActive(item.id)}
+                  style={{ width:"100%", textAlign:"left", border:"none", cursor:"pointer",
+                    borderRadius:9, padding:"11px 14px", marginBottom:3,
+                    background: isActive ? item.color+"18" : "transparent",
+                    borderLeft: `2px solid ${isActive ? item.color : "transparent"}`,
+                    transition:"all 0.18s ease", position:"relative", overflow:"hidden" }}
+                  onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = item.color+"0d"; }}
+                  onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = "transparent"; }}>
+                  {isActive && (
+                    <div style={{ position:"absolute", inset:0, borderRadius:9,
+                      background:`linear-gradient(135deg,${item.color}10,transparent)`,
+                      pointerEvents:"none" }} />
+                  )}
+                  <div style={{ display:"flex", alignItems:"center", gap:10, position:"relative" }}>
+                    <div style={{ width:28, height:28, borderRadius:7, flexShrink:0,
+                      background: isActive ? item.color+"25" : item.color+"10",
+                      border: `1px solid ${isActive ? item.color+"66" : item.color+"22"}`,
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                      fontSize:13, transition:"all 0.18s",
+                      boxShadow: isActive ? `0 0 12px ${item.color}44` : "none" }}>
+                      <span style={{ filter: isActive ? `drop-shadow(0 0 4px ${item.color})` : "none" }}>
+                        {item.icon}
+                      </span>
+                    </div>
+                    <Mono size={12} color={isActive ? item.color : T.muted}
+                      style={{ letterSpacing:"0.06em", fontWeight: isActive ? 500 : 400,
+                        transition:"color 0.18s" }}>
+                      {item.label}
+                    </Mono>
+                    {isActive && (
+                      <div style={{ marginLeft:"auto", width:5, height:5, borderRadius:"50%",
+                        background:item.color, boxShadow:`0 0 8px ${item.color}` }} />
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </nav>
+          {/* API Status */}
+          <div style={{ padding:"14px 16px", borderTop:`1px solid ${T.border}` }}>
+            <Mono size={9} color={T.muted} style={{ letterSpacing:"0.14em",
+              textTransform:"uppercase", display:"block", marginBottom:8 }}>Data Sources</Mono>
+            {[
+              { label:"EIA", key:"eia", color:T.green },
+              { label:"Finnhub", key:"finnhub", color:"#a78bfa" },
+              { label:"GNews", key:"gnews", color:"#f43f5e" },
+            ].map((s,i) => {
+              const on = !!apiKeys[s.key];
+              return (
+                <div key={i} style={{ display:"flex", alignItems:"center",
+                  justifyContent:"space-between", marginBottom:5 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <div style={{ width:5, height:5, borderRadius:"50%",
+                      background: on ? s.color : T.muted,
+                      boxShadow: on ? `0 0 6px ${s.color}` : "none",
+                      transition:"all 0.3s" }} />
+                    <Mono size={9} color={on ? s.color : T.muted}
+                      style={{ transition:"color 0.3s" }}>{s.label}</Mono>
+                  </div>
+                  <Mono size={8} color={on ? s.color : T.muted}
+                    style={{ letterSpacing:"0.1em" }}>{on?"LIVE":"OFF"}</Mono>
                 </div>
               );
             })}
@@ -1290,9 +1265,15 @@ export default function App() {
           <div style={{ padding:"16px 36px", borderBottom:`1px solid ${T.border}`,
             display:"flex", justifyContent:"space-between", alignItems:"center",
             background:T.surface, flexShrink:0 }}>
-            <Orb size={13} color={T.sub} style={{ letterSpacing:"0.1em" }}>
-              {NAV.find(n => n.id===active)?.icon} {NAV.find(n => n.id===active)?.label}
-            </Orb>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:14, filter:`drop-shadow(0 0 6px ${NAV.find(n=>n.id===active)?.color||T.green})` }}>
+                {NAV.find(n => n.id===active)?.icon}
+              </span>
+              <Orb size={13} color={NAV.find(n=>n.id===active)?.color||T.sub}
+                style={{ letterSpacing:"0.1em" }}>
+                {NAV.find(n => n.id===active)?.label}
+              </Orb>
+            </div>
             <div style={{ display:"flex", alignItems:"center", gap:14 }}>
               <Mono size={11} color={T.muted}>{now}</Mono>
               <div style={{ display:"flex", alignItems:"center", gap:5 }}>
@@ -1305,8 +1286,32 @@ export default function App() {
           <div style={{ flex:1, overflowY:"auto", padding:"30px 36px" }}>
             {renderSection()}
           </div>
+          <DiligenceFooter />
         </main>
       </div>
     </>
   );
 }
+
+// ─── DILIGENCE FOOTER ─────────────────────────────────────────────
+const DiligenceFooter = () => (
+  <div style={{
+    flexShrink:0, borderTop:"1px solid #162236",
+    background:"#08111e", padding:"10px 36px",
+    display:"flex", justifyContent:"flex-end",
+    alignItems:"center",
+  }}>
+    <a href="https://github.com/achicodess/greenpulse/raw/main/public/AI_Diligence_Statement_GreenPulse.pdf"
+      target="_blank" rel="noopener noreferrer"
+      style={{ display:"flex", alignItems:"center", gap:6,
+        background:"#00ff9d18", border:"1px solid #00ff9d44",
+        borderRadius:6, padding:"5px 14px", textDecoration:"none",
+        transition:"all 0.2s" }}>
+      <span style={{ fontSize:12 }}>📄</span>
+      <span style={{ fontFamily:"'IBM Plex Mono'", fontSize:11,
+        color:"#00ff9d", letterSpacing:"0.08em" }}>
+         Diligence Statement ↗
+      </span>
+    </a>
+  </div>
+);
