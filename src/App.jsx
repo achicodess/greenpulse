@@ -196,10 +196,10 @@ const MAP_REGIONS = [
 
 // ─── GNEWS FETCH ─────────────────────────────────────────────────
 const GNEWS_TOPICS = {
-  solar:     { label:"Solar",     q:"solar energy",         color:T.green  },
-  hydrogen:  { label:"Hydrogen",  q:"green hydrogen energy", color:T.cyan   },
-  markets:   { label:"Markets",   q:"clean energy stocks",   color:T.yellow },
-  policy:    { label:"Policy",    q:"renewable energy policy",color:T.purple },
+  solar:     { label:"Solar",     q:"solar energy",   color:T.green  },
+  hydrogen:  { label:"Hydrogen",  q:"green hydrogen", color:T.cyan   },
+  markets:   { label:"Markets",   q:"clean energy",   color:T.yellow },
+  policy:    { label:"Policy",    q:"energy policy",  color:T.purple },
 };
 
 async function fetchGNews(topic, apiKey) {
@@ -209,12 +209,19 @@ async function fetchGNews(topic, apiKey) {
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
   return dedupe(cacheKey, async () => {
+    // GNews requires: apikey= (not token=), simple short query, max=10
     const q = encodeURIComponent(GNEWS_TOPICS[topic].q);
-    const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&token=${trimmedKey}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
-    if (res.status === 403) throw new Error("GNews API key invalid or expired. Re-enter in Settings.");
-    if (res.status === 429) throw new Error("GNews rate limit reached (100/day). Try again tomorrow.");
-    if (!res.ok) throw new Error(`GNews error (HTTP ${res.status}). Try refreshing.`);
+    const url = `https://gnews.io/api/v4/search?q=${q}&lang=en&max=10&apikey=${trimmedKey}`;
+    let res;
+    try {
+      res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    } catch (e) {
+      throw new Error("Network error — check your internet connection.");
+    }
+    if (res.status === 400) throw new Error("GNews rejected the request — your key may be invalid. Re-enter in Settings.");
+    if (res.status === 401 || res.status === 403) throw new Error("GNews API key invalid or expired. Re-enter in Settings.");
+    if (res.status === 429) throw new Error("GNews rate limit reached (100 req/day). Try again tomorrow.");
+    if (!res.ok) throw new Error(`GNews error (HTTP ${res.status}).`);
     const json = await res.json();
     if (json.errors?.length) throw new Error(json.errors[0]);
     if (!json.articles?.length) throw new Error("No articles found for this topic.");
@@ -964,7 +971,7 @@ const Settings = ({ apiKeys, setApiKeys }) => {
         await fetchFinnhub("FSLR", local.finnhub);
         setTestResults(r => ({ ...r, finnhub:{ ok:true, msg:"✓ Finnhub connection successful!" } }));
       } else if (key === "gnews") {
-        await fetchGNews("solar", local.gnews);
+        await fetchGNews("solar", local.gnews.trim());
         setTestResults(r => ({ ...r, gnews:{ ok:true, msg:"✓ GNews connection successful!" } }));
       }
     } catch(e) {
@@ -1172,7 +1179,7 @@ export default function App() {
               <div style={{ width:28, height:28, borderRadius:8,
                 background:`linear-gradient(135deg,${T.green}33,${T.cyan}22)`,
                 border:`1px solid ${T.green}44`, display:"flex", alignItems:"center",
-                justifyContent:"center", fontSize:14 }}></div>
+                justifyContent:"center", fontSize:14 }}>⚡</div>
               <div>
                 <Orb size={15} weight={900} color={T.green} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>GREEN</Orb>
                 <Orb size={13} weight={900} color={T.cyan} style={{ display:"block", letterSpacing:"0.08em", lineHeight:1 }}>PULSE</Orb>
