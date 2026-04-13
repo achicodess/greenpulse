@@ -14,7 +14,7 @@
 
 *Real-time solar generation · Live equity markets · AI-powered news*
 
-[![Live Demo](https://img.shields.io/badge/LIVE-greenpulse.netlify.app-00ff9d?style=for-the-badge&logo=netlify&logoColor=white)](https://greenpulse.netlify.app)
+[![Live Demo](https://img.shields.io/badge/LIVE-greenpulse.netlify.app-00ff9d?style=for-the-badge&logo=netlify&logoColor=white)]([https://greenpulse.netlify.app](https://greennpulse.netlify.app/))
 ![React](https://img.shields.io/badge/React_18-61dafb?style=for-the-badge&logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite_5-646cff?style=for-the-badge&logo=vite&logoColor=white)
 ![Recharts](https://img.shields.io/badge/Recharts-22d3ee?style=for-the-badge)
